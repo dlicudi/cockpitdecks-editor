@@ -2810,16 +2810,22 @@ class EditorTab(QWidget):
                 ann_model = str(ann.get("model") or "B")
                 ann_style = str(ann.get("annunciator-style") or "")
                 ann_size = str(ann.get("size") or "medium")
-                parts = ann.get("parts") or {}
-                if isinstance(parts, dict):
-                    for part_id in _ANNUNCIATOR_PART_IDS.get(ann_model, []):
-                        part_cfg = parts.get(part_id) or {}
-                        part_texts[part_id] = str(part_cfg.get("text") or "")
-                        part_fonts[part_id] = str(part_cfg.get("text-font") or "")
-                        part_sizes[part_id] = int(part_cfg.get("text-size") or 0)
-                        part_colors[part_id] = str(part_cfg.get("color") or "")
-                        part_formulas[part_id] = str(part_cfg.get("formula") or "")
-                        part_leds[part_id] = str(part_cfg.get("led") or "")
+                parts_raw = ann.get("parts") or []
+                part_ids_for_model = _ANNUNCIATOR_PART_IDS.get(ann_model, [])
+                if isinstance(parts_raw, list):
+                    parts = {part_ids_for_model[i]: parts_raw[i] for i in range(min(len(parts_raw), len(part_ids_for_model))) if isinstance(parts_raw[i], dict)}
+                elif isinstance(parts_raw, dict):
+                    parts = parts_raw
+                else:
+                    parts = {}
+                for part_id in part_ids_for_model:
+                    part_cfg = parts.get(part_id) or {}
+                    part_texts[part_id] = str(part_cfg.get("text") or "")
+                    part_fonts[part_id] = str(part_cfg.get("text-font") or "")
+                    part_sizes[part_id] = int(part_cfg.get("text-size") or 0)
+                    part_colors[part_id] = str(part_cfg.get("color") or "")
+                    part_formulas[part_id] = str(part_cfg.get("formula") or "")
+                    part_leds[part_id] = str(part_cfg.get("led") or "")
             else:
                 ann_style = ""
                 ann_size = "medium"
@@ -2974,10 +2980,15 @@ class EditorTab(QWidget):
             else:
                 ann.pop("annunciator-style", None)
             ann["size"] = str(self.visual_ann_size.currentData() or "medium")
-            raw_parts = dict(ann.get("parts") or {})
             model = ann["model"]
             wanted_parts = _ANNUNCIATOR_PART_IDS.get(model, ["B0", "B1"])
-            parts = {k: dict(v) for k, v in raw_parts.items() if k in wanted_parts and isinstance(v, dict)}
+            raw_parts_input = ann.get("parts") or []
+            if isinstance(raw_parts_input, list):
+                parts = {wanted_parts[i]: dict(raw_parts_input[i]) for i in range(min(len(raw_parts_input), len(wanted_parts))) if isinstance(raw_parts_input[i], dict)}
+            elif isinstance(raw_parts_input, dict):
+                parts = {k: dict(v) for k, v in raw_parts_input.items() if k in wanted_parts and isinstance(v, dict)}
+            else:
+                parts = {}
             for idx, row in enumerate(self.visual_ann_part_rows):
                 if idx >= len(wanted_parts):
                     continue
@@ -3019,8 +3030,10 @@ class EditorTab(QWidget):
                     parts[part_id] = part_cfg
                 elif part_id in parts:
                     parts.pop(part_id, None)
-            if parts:
-                ann["parts"] = parts
+            # Write parts as an ordered list (positional, matching wanted_parts order)
+            parts_list = [parts[pid] for pid in wanted_parts if pid in parts and parts[pid]]
+            if parts_list:
+                ann["parts"] = parts_list
             else:
                 ann.pop("parts", None)
             data["annunciator"] = ann
