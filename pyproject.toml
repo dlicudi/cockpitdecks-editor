@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cockpitdecks-editor"
+version = "0.1.0"
+description = "Dedicated Cockpitdecks config editor."
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+  { name = "Cockpitdecks Team" }
+]
+dependencies = [
+  "certifi>=2024.0.0",
+  "Pillow>=10.0",
+  "PySide6>=6.9",
+  "pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'",
+  "pyyaml>=6.0",
+]
+
+[project.scripts]
+cockpitdecks-editor = "cockpitdecks_editor.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cockpitdecks_editor"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/cockpitdecks_editor/resources" = "cockpitdecks_editor/resources"
