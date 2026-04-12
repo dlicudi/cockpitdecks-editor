@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import io
+import logging
 import pkgutil
 import threading
+from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 import importlib
@@ -68,9 +71,145 @@ class _PreviewCockpit(Cockpit):
         self.load_defaults()
 
 
+@lru_cache(maxsize=1)
+def get_representation_schema_map() -> dict[str, dict[str, Any]]:
+    """Return representation editor schemas keyed by representation name."""
+    cockpit = _PreviewCockpit({"SIMULATOR_NAME": "NoSimulator"})
+    cockpit.add_extensions(trace_ext_loading=False)
+    schemas = {}
+    nested_block_names = {
+        "annunciator",
+        "annunciator-animate",
+        "chart",
+        "circular-switch",
+        "compass",
+        "data",
+        "gauge",
+        "knob",
+        "push-switch",
+        "switch",
+        "tape",
+        "weather-metar",
+        "weather-real",
+        "weather-xp",
+    }
+    for cls in Cockpit.all_subclasses(Representation):
+        name = cls.name()
+        if name.endswith("-base"):
+            continue
+        if hasattr(cls, "editor_schema"):
+            schemas[name] = cls.editor_schema()
+        else:
+            schemas[name] = {
+                "name": name,
+                "label": getattr(cls, "EDITOR_LABEL", None) or cls.__name__,
+                "family": getattr(cls, "EDITOR_FAMILY", None) or "Representation",
+                "editor_fields": cls.parameters(),
+            }
+        schemas[name]["storage_mode"] = "nested_block" if name in nested_block_names else "flat"
+    if DECK_FEEDBACK.NONE.value not in schemas:
+        schemas[DECK_FEEDBACK.NONE.value] = Representation.editor_schema()
+        schemas[DECK_FEEDBACK.NONE.value]["storage_mode"] = "flat"
+    return schemas
+
+
 class _PreviewDeck(DeckWithIcons):
     DECK_NAME = "desktop-preview"
     DEVICE_MANAGER = None
+
+    def preprocess_buttons(self, buttons: list, page) -> list:
+        deck_type_name = str(self._config.get("type") or "").strip().lower()
+        buttons = [self.normalize_button_config(button) if isinstance(button, dict) else button for button in buttons]
+        if deck_type_name != "loupedecklive":
+            return buttons
+
+        left_encoders = ["e0", "e1", "e2"]
+        right_encoders = ["e3", "e4", "e5"]
+        all_encoders = set(left_encoders + right_encoders)
+        side_display_keys = {
+            "label",
+            "label-color",
+            "label-size",
+            "label-font",
+            "label-position",
+            "text",
+            "text-color",
+            "text-size",
+            "text-font",
+            "text-position",
+            "text-format",
+            "formula",
+        }
+
+        def _rep_type(button: dict) -> str:
+            """Return the representation type string regardless of whether it is stored
+            as a plain string or as a nested dict with a 'type' key."""
+            rep_val = button.get("representation") or ""
+            if isinstance(rep_val, dict):
+                return str(rep_val.get("type") or "").strip()
+            return str(rep_val).strip()
+
+        has_display = False
+        indices: set[str] = set()
+        for button in buttons:
+            idx = str(button.get("index") or "")
+            indices.add(idx)
+            if idx in all_encoders and ("display" in button or _rep_type(button) in {"side-display", "side"}):
+                has_display = True
+        if not has_display or "left" in indices or "right" in indices:
+            return buttons
+
+        merged = getattr(page, "_defaults", {})
+        screen_config = merged.get("screen") or page._config.get("screen") or {}
+        icon_color = screen_config.get("background", "Black")
+        render_cooldown = screen_config.get("render-cooldown-ms")
+
+        left_displays: dict[int, dict] = {}
+        right_displays: dict[int, dict] = {}
+        new_buttons: list = []
+
+        for button in buttons:
+            idx = str(button.get("index") or "")
+            if idx in all_encoders:
+                button = dict(button)
+                display = button.pop("display", None)
+                if not isinstance(display, dict):
+                    display = {}
+                rep = _rep_type(button)
+                if rep in {"side-display", "side"}:
+                    if not display:
+                        rep_val = button.get("representation")
+                        if isinstance(rep_val, dict):
+                            # Dict-style: display config lives inside the representation dict
+                            display = {key: rep_val.get(key) for key in side_display_keys if rep_val.get(key) not in (None, "")}
+                        else:
+                            display = {key: button.get(key) for key in side_display_keys if button.get(key) not in (None, "")}
+                    button.pop("representation", None)
+                    for key in side_display_keys:
+                        button.pop(key, None)
+                if idx in left_encoders:
+                    left_displays[left_encoders.index(idx)] = display
+                else:
+                    right_displays[right_encoders.index(idx)] = display
+            new_buttons.append(button)
+
+        def make_screen_button(index: str, name: str, labels: list[dict]) -> dict[str, Any]:
+            out: dict[str, Any] = {
+                "index": index,
+                "name": name,
+                "activation": "none",
+                "representation": "side-display",
+                "side": {"icon-color": icon_color, "labels": labels},
+            }
+            if render_cooldown is not None:
+                out["render-cooldown-ms"] = render_cooldown
+            return out
+
+        if left_displays:
+            new_buttons.append(make_screen_button("left", "left_screen", [left_displays.get(i, {}) for i in range(len(left_encoders))]))
+        if right_displays:
+            new_buttons.append(make_screen_button("right", "right_screen", [right_displays.get(i, {}) for i in range(len(right_encoders))]))
+        return new_buttons
 
     def make_default_page(self, b: str | None = None):
         return None
@@ -80,6 +219,30 @@ class _PreviewDeck(DeckWithIcons):
 
     def start(self):
         return None
+
+
+class _LogCapture(logging.Handler):
+    """Captures WARNING+ log records from cockpitdecks during a render."""
+
+    def __init__(self) -> None:
+        super().__init__(logging.WARNING)
+        self.records: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(self.format(record))
+
+
+@contextmanager
+def _capture_logs():
+    """Temporarily attach a capturing handler to the cockpitdecks root logger."""
+    handler = _LogCapture()
+    handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+    root = logging.getLogger("cockpitdecks")
+    root.addHandler(handler)
+    try:
+        yield handler
+    finally:
+        root.removeHandler(handler)
 
 
 class _NativePreviewContext:
@@ -183,10 +346,65 @@ def warm_preview_pool(target_root: str | Path) -> str | None:
         return str(exc)
 
 
+_SIDE_DISPLAY_KEYS = {
+    "label", "label-color", "label-size", "label-font", "label-position",
+    "text", "text-color", "text-size", "text-font", "text-position",
+    "text-format", "formula",
+}
+_LEFT_ENCODERS = ["e0", "e1", "e2"]
+_RIGHT_ENCODERS = ["e3", "e4", "e5"]
+
+
+def _side_display_slot_config(config: dict) -> tuple[dict, int] | None:
+    """If *config* is a side-display encoder button (index eN), return a tuple of
+    (screen_button_config, slot_index) suitable for rendering the full "left"/"right"
+    strip with only that encoder's slot populated.  Returns None for all other buttons.
+    """
+    idx = str(config.get("index") or "").strip().lower()
+    if idx not in _LEFT_ENCODERS and idx not in _RIGHT_ENCODERS:
+        return None
+
+    rep_val = config.get("representation") or ""
+    if isinstance(rep_val, dict):
+        rep_type = str(rep_val.get("type") or "").strip()
+    else:
+        rep_type = str(rep_val).strip()
+    if rep_type not in {"side-display", "side"}:
+        return None
+
+    # Extract display properties from wherever they live (dict representation or top-level).
+    if isinstance(rep_val, dict):
+        display = {k: rep_val[k] for k in _SIDE_DISPLAY_KEYS if rep_val.get(k) not in (None, "")}
+    else:
+        display = {k: config[k] for k in _SIDE_DISPLAY_KEYS if config.get(k) not in (None, "")}
+
+    if idx in _LEFT_ENCODERS:
+        slot = _LEFT_ENCODERS.index(idx)
+        screen_index = "left"
+        screen_name = "left_screen"
+    else:
+        slot = _RIGHT_ENCODERS.index(idx)
+        screen_index = "right"
+        screen_name = "right_screen"
+
+    labels: list[dict] = [{}, {}, {}]
+    labels[slot] = display
+
+    screen_config: dict[str, Any] = {
+        "index": screen_index,
+        "name": screen_name,
+        "activation": "none",
+        "representation": "side-display",
+        "side": {"icon-color": "Black", "labels": labels},
+    }
+    return screen_config, slot
+
+
 def render_button_preview_native(
     target_root: str | Path,
     deck_name: str,
     button_yaml: str,
+    fake_datarefs: dict[str, Any] | None = None,
 ) -> tuple[bytes | None, dict[str, Any] | None, str | None]:
     try:
         root = Path(target_root).expanduser().resolve()
@@ -202,29 +420,70 @@ def render_button_preview_native(
     if not isinstance(config, dict):
         return None, None, "preview config must be a YAML mapping"
 
+    # Side-display encoder buttons (eN) must be rendered as "left"/"right" strip buttons.
+    # We build a full strip config with only the relevant slot filled, then crop afterwards.
+    side_slot: int | None = None
+    slot_result = _side_display_slot_config(config)
+    if slot_result is not None:
+        config, side_slot = slot_result
+
     try:
         pool = _get_pool(root)
         ctx = pool.acquire()
-        with ctx.lock:
+        with ctx.lock, _capture_logs() as captured:
             deck = ctx.get_deck(deck_name)
             button = deck.make_button(config=config)
             if button is None:
-                return None, None, "button not created"
+                log_detail = "\n".join(captured.records)
+                msg = "button not created"
+                if log_detail:
+                    msg = f"{msg}\n\n{log_detail}"
+                return None, None, msg
+            if fake_datarefs:
+                for dr_name, dr_value in fake_datarefs.items():
+                    var = ctx.cockpit.variable_database.get(dr_name)
+                    if var is not None:
+                        var.value = dr_value
             image = button.get_representation()
             if image is None:
-                return None, None, "button representation not created"
+                log_detail = "\n".join(captured.records)
+                msg = "button representation not created"
+                if log_detail:
+                    msg = f"{msg}\n\n{log_detail}"
+                return None, None, msg
             target_size = deck.get_spanned_image_size(button) or deck.get_image_size(button.index)
             if target_size and getattr(image, "size", None) != target_size:
                 image = image.resize(target_size, resample=Image.Resampling.LANCZOS)
+            # For side-display encoder previews, crop the full strip to the relevant 1/3 slot.
+            if side_slot is not None:
+                h = image.size[1]
+                slot_h = h // 3
+                top = side_slot * slot_h
+                bottom = top + slot_h if side_slot < 2 else h
+                image = image.crop((0, top, image.size[0], bottom))
             buf = io.BytesIO()
             image.save(buf, format="PNG")
+            act_valid = button._activation.is_valid()
+            rep_valid = button._representation.is_valid()
+            warnings = "\n".join(captured.records)
             meta = {
                 "error": "ok",
-                "activation-valid": button._activation.is_valid(),
-                "representation-valid": button._representation.is_valid(),
+                "activation-valid": act_valid,
+                "representation-valid": rep_valid,
                 "activation-desc": button._activation.describe(),
                 "representation-desc": button._representation.describe(),
+                "warnings": warnings,
             }
+            # Surface validity issues as a soft warning (image still rendered)
+            if not act_valid or not rep_valid or warnings:
+                parts = []
+                if not act_valid:
+                    parts.append("activation invalid")
+                if not rep_valid:
+                    parts.append("representation invalid")
+                if warnings:
+                    parts.append(warnings)
+                meta["error"] = " · ".join(parts)
             return buf.getvalue(), meta, None
     except Exception as exc:
         return None, None, str(exc)

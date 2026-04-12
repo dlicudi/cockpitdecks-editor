@@ -49,7 +49,7 @@ except ImportError:
 
 
 from cockpitdecks_editor.services.live_apis import render_button_preview
-from cockpitdecks_editor.services.native_preview import describe_slot_native, list_preview_fonts, render_button_preview_native, warm_preview_pool
+from cockpitdecks_editor.services.native_preview import describe_slot_native, list_preview_fonts, render_button_preview_native, warm_preview_pool, _side_display_slot_config
 from cockpitdecks_editor.services.desktop_settings import load as load_settings, save as save_settings
 
 
@@ -73,13 +73,24 @@ def _render_preview_with_fallback(
     target_root: Path | None,
     deck_name: str,
     button_yaml: str,
+    fake_datarefs: dict | None = None,
 ) -> tuple[bytes | None, dict | None, str | None]:
     if target_root is None:
         return None, None, "no preview target"
-    image_bytes, meta, error = render_button_preview(deck_name, button_yaml)
-    if image_bytes:
-        return image_bytes, meta, error
-    return render_button_preview_native(target_root, deck_name, button_yaml)
+    if not fake_datarefs:
+        # Skip the HTTP preview path for side-display encoder buttons (eN index).
+        # The live cockpitdecks server returns the full 3-slot strip without the
+        # per-encoder crop that render_button_preview_native applies.
+        try:
+            _cfg = yaml.safe_load(button_yaml) or {}
+            _skip_http = isinstance(_cfg, dict) and _side_display_slot_config(_cfg) is not None
+        except Exception:
+            _skip_http = False
+        if not _skip_http:
+            image_bytes, meta, error = render_button_preview(deck_name, button_yaml)
+            if image_bytes:
+                return image_bytes, meta, error
+    return render_button_preview_native(target_root, deck_name, button_yaml, fake_datarefs=fake_datarefs)
 
 
 class _ButtonEditDocument:
@@ -134,18 +145,32 @@ _ACTIVATION_SCHEMA: dict[str, list[tuple[str, str]]] = {
     "Push Button": [
         ("push", "Momentary Command"),
         ("begin-end-command", "Begin / End Command"),
-        ("encoder-toggle", "Toggle On/Off"),
         ("short-or-long-press", "Short / Long Press"),
+        ("sweep", "Sweep (Multi-position)"),
+    ],
+    "Encoder": [
+        ("encoder-push", "Rotate + Push"),
+        ("encoder-mode", "Rotate + Mode Toggle"),
+        ("encoder", "Rotate Only"),
+        ("encoder-toggle", "Rotate + Toggle"),
+        ("encoder-value", "Encoder Value"),
+        ("encoder-value-extended", "Encoder Value Extended"),
     ],
     "Page": [
         ("page", "Load Page"),
         ("page-cycle", "Cycle Pages"),
+    ],
+    "Touch": [
+        ("slider", "Slider"),
+        ("swipe", "Swipe"),
+        ("mosaic", "Mosaic Surface"),
     ],
     "System": [
         ("reload", "Reload"),
         ("theme", "Theme"),
         ("inspect", "Inspect"),
         ("stop", "Stop"),
+        ("simulator", "Start Simulator"),
     ],
     "Passive": [
         ("none", "No Activation"),
@@ -154,21 +179,36 @@ _ACTIVATION_SCHEMA: dict[str, list[tuple[str, str]]] = {
 
 _REPRESENTATION_SCHEMA: dict[str, list[tuple[str, str]]] = {
     "Basic": [
-        ("standard", "Standard Text / Icon"),
-        ("text", "Text Tile"),
+        ("icon-color", "Solid / Textured Icon"),
+        ("icon", "Icon"),
+        ("text", "Text"),
+        ("standard", "Standard (legacy)"),
+        ("side-display", "Loupedeck Side Display"),
+        ("multi-texts", "Multi Texts"),
     ],
     "Annunciator": [
         ("annunciator", "Annunciator"),
+        ("annunciator-animate", "Annunciator Animated"),
     ],
-    "Data": [
+    "Data / Readout": [
         ("data", "Data Tile"),
+        ("textpage", "Text Page"),
     ],
     "Switch": [
         ("switch", "Switch"),
         ("push-switch", "Push Switch"),
+        ("circular-switch", "Circular Switch"),
+        ("knob", "Knob"),
     ],
-    "Gauge": [
+    "Gauge / Dial": [
         ("gauge", "Gauge"),
+        ("tape", "Tape"),
+        ("compass", "Compass"),
+    ],
+    "Hardware": [
+        ("led", "LED"),
+        ("hardware-icon", "Hardware Icon"),
+        ("virtual-encoder", "Virtual Encoder"),
     ],
 }
 
@@ -229,8 +269,9 @@ def _two_command_fields(action_type: str) -> tuple[str, str] | None:
 
 
 def _button_preview_validation_error(data: dict) -> str | None:
-    action_type = str(data.get("activation") or "push").strip()
-    commands = data.get("commands") or {}
+    activation_cfg = data.get("activation") if isinstance(data.get("activation"), dict) else {}
+    action_type = str(activation_cfg.get("type") or data.get("activation") or "push").strip()
+    commands = activation_cfg.get("commands") if isinstance(activation_cfg.get("commands"), dict) else data.get("commands") or {}
     if action_type == "begin-end-command" and not str(commands.get("press") or "").strip():
         return "Begin / End Command needs a command."
     if action_type == "encoder-toggle":
@@ -243,13 +284,17 @@ def _button_preview_validation_error(data: dict) -> str | None:
         fields = _two_command_fields(action_type)
         if fields is None or not all(str(commands.get(field) or "").strip() for field in fields):
             return "Short / Long Press needs short and long commands."
-    if action_type == "page" and not str(data.get("page") or "").strip():
+    if action_type == "page" and not str(activation_cfg.get("page") or data.get("page") or "").strip():
         return "Load Page needs a page name."
     if action_type == "page-cycle":
-        pages = data.get("pages")
+        pages = activation_cfg.get("pages") if isinstance(activation_cfg.get("pages"), list) else data.get("pages")
         if not isinstance(pages, list) or len(pages) < 2:
             return "Cycle Pages needs at least two pages."
     return None
+
+
+def _known_visual_representation_styles() -> set[str]:
+    return {name for items in _REPRESENTATION_SCHEMA.values() for name, _ in items}
 
 
 class _VisualButtonCard(QFrame):
@@ -344,51 +389,53 @@ class _VisualButtonCard(QFrame):
                 target_w = max(1, self.width())
                 target_h = max(1, self.height())
                 preview_label.setFixedSize(target_w, target_h)
-                pixmap = QPixmap(preview)
-                src_w = max(1, pixmap.width())
-                src_h = max(1, pixmap.height())
+                src = QPixmap(preview)
+                scaled = src.scaled(
+                    target_w,
+                    target_h,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                canvas = QPixmap(target_w, target_h)
+                canvas.fill(Qt.GlobalColor.transparent)
 
-                # Scale up if the rendered preview is smaller than the card's logical size.
-                if src_w < target_w or src_h < target_h:
-                    scale = max(target_w / src_w, target_h / src_h)
-                    pixmap = pixmap.scaled(
-                        int(src_w * scale), int(src_h * scale),
-                        Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.SmoothTransformation,
-                    )
-                    src_w = max(1, pixmap.width())
-                    src_h = max(1, pixmap.height())
-
-                # DPR trick for downscaling on HiDPI: keep hi-res pixels, tell Qt to
-                # render them at the logical target size.
-                dpr = max(1.0, min(src_w / target_w, src_h / target_h))
-
-                rounded = QPixmap(pixmap.size())
+                rounded = QPixmap(canvas.size())
                 rounded.fill(Qt.GlobalColor.transparent)
                 painter = QPainter(rounded)
                 painter.setRenderHint(QPainter.RenderHint.Antialiasing)
                 painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
                 path = QPainterPath()
-                # Match the grid slot corner treatment with a small logical radius,
-                # instead of scaling corner roundness with the full spanned image size.
-                logical_radius = 8.0
-                radius_scale = min(src_w / max(1, target_w), src_h / max(1, target_h))
-                radius = max(1.0, logical_radius * radius_scale)
-                path.addRoundedRect(0, 0, src_w, src_h, radius, radius)
+                radius = 8.0
+                path.addRoundedRect(0, 0, target_w, target_h, radius, radius)
                 painter.setClipPath(path)
-                painter.drawPixmap(0, 0, pixmap)
+                x = max(0, (target_w - scaled.width()) // 2)
+                y = max(0, (target_h - scaled.height()) // 2)
+                painter.drawPixmap(x, y, scaled)
                 painter.end()
-                pixmap = rounded
-
-                pixmap.setDevicePixelRatio(dpr)
-                preview_label.setPixmap(pixmap)
+                preview_label.setPixmap(rounded)
                 if shiboken is not None and shiboken.isValid(self._layout):
                     self._layout.addWidget(preview_label, 1)
                 return
 
-            title = str(self.button_data.get("label") or self.button_data.get("text") or self.button_data.get("name") or self.button_data.get("activation") or "Button")
-            _cmds = self.button_data.get("commands") or {}
-            subtitle = str(self.button_data.get("text") or _cmds.get("press") or self.button_data.get("page") or self.button_data.get("activation") or "").strip()
+            activation_cfg = self.button_data.get("activation") if isinstance(self.button_data.get("activation"), dict) else {}
+            representation_cfg = self.button_data.get("representation") if isinstance(self.button_data.get("representation"), dict) else {}
+            title = str(
+                representation_cfg.get("label")
+                or representation_cfg.get("text")
+                or self.button_data.get("name")
+                or activation_cfg.get("type")
+                or self.button_data.get("activation")
+                or "Button"
+            )
+            _cmds = activation_cfg.get("commands") if isinstance(activation_cfg.get("commands"), dict) else self.button_data.get("commands") or {}
+            subtitle = str(
+                representation_cfg.get("text")
+                or _cmds.get("press")
+                or activation_cfg.get("page")
+                or activation_cfg.get("type")
+                or self.button_data.get("activation")
+                or ""
+            ).strip()
             if len(subtitle) > 26:
                 subtitle = subtitle[:23] + "…"
 
@@ -887,6 +934,7 @@ class EditorTab(QWidget):
     preview_ready = Signal(str, object, object)
     button_edit_preview_ready = Signal(object, object)
     preview_warm_ready = Signal(str, object)
+    open_in_designer = Signal(str, str, str, str, str)  # button_yaml, deck_name, root_path, button_id, file_path
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -926,6 +974,10 @@ class EditorTab(QWidget):
         self._span_card_specs: dict[str, tuple[int, int, int, int]] = {}
         self._effective_page_attrs_cache: dict = {}
         self._selected_slot_info: dict = {}
+        self._include_btn_style = ""
+        self._loupedeck_live_mode = False
+        self._loupedeck_encoder_mode = False
+        self._included_buttons: dict[str, tuple[dict, Path]] = {}  # button_id → (data, source_file)
         self._button_edit_id: str | None = None
         self._button_edit_on_apply = None
         self._button_edit_base_text = ""
@@ -941,14 +993,6 @@ class EditorTab(QWidget):
         self._button_edit_preview_timer = QTimer(self)
         self._button_edit_preview_timer.setSingleShot(True)
         self._button_edit_preview_timer.timeout.connect(self._render_button_edit_preview)
-
-        self._page_autosave_timer = QTimer(self)
-        self._page_autosave_timer.setSingleShot(True)
-        self._page_autosave_timer.timeout.connect(self._autosave_page)
-
-        self._button_autosave_timer = QTimer(self)
-        self._button_autosave_timer.setSingleShot(True)
-        self._button_autosave_timer.timeout.connect(self._autosave_button)
 
         self._save_clear_timer = QTimer(self)
         self._save_clear_timer.setSingleShot(True)
@@ -993,6 +1037,12 @@ class EditorTab(QWidget):
         self.btn_reveal_target = QPushButton("Reveal Root")
         self.btn_reveal_target.clicked.connect(self._reveal_target)
         toolbar_layout.addWidget(self.btn_reveal_target)
+
+        self.btn_save = QPushButton("Save")
+        self.btn_save.setShortcut(QKeySequence.StandardKey.Save)
+        self.btn_save.setEnabled(False)
+        self.btn_save.clicked.connect(self._save_current_and_apply_button)
+        toolbar_layout.addWidget(self.btn_save)
 
         root.addWidget(toolbar)
 
@@ -1101,6 +1151,56 @@ class EditorTab(QWidget):
         self.visual_hint = QLabel("Visual mode is available for YAML page files with a `buttons:` list.")
         self.visual_hint.setWordWrap(True)
         self.visual_layout.addWidget(self.visual_hint)
+
+        # ── Includes navigation bar ──────────────────────────────────────────────
+        self.includes_bar = QWidget()
+        self.includes_bar_layout = QHBoxLayout(self.includes_bar)
+        self.includes_bar_layout.setContentsMargins(0, 0, 0, 0)
+        self.includes_bar_layout.setSpacing(6)
+        self.includes_bar_label = QLabel("Includes:")
+        self.includes_bar_layout.addWidget(self.includes_bar_label)
+        self.includes_bar_layout.addStretch(1)
+        self.includes_bar.setVisible(False)
+        self.visual_layout.addWidget(self.includes_bar)
+
+        # ── Loupedeck Live hardware layout widget ────────────────────────────
+        self.loupedeck_live_host = QWidget()
+        _ld_outer = QVBoxLayout(self.loupedeck_live_host)
+        _ld_outer.setContentsMargins(0, 0, 0, 0)
+        _ld_outer.setSpacing(8)
+        # Main row: left encoders | center 4×3 grid | right encoders
+        self._ld_main_row = QWidget()
+        _ld_main = QHBoxLayout(self._ld_main_row)
+        _ld_main.setContentsMargins(0, 0, 0, 0)
+        _ld_main.setSpacing(8)
+        self._ld_enc_left = QWidget()
+        self._ld_enc_left_layout = QVBoxLayout(self._ld_enc_left)
+        self._ld_enc_left_layout.setContentsMargins(0, 0, 0, 0)
+        self._ld_enc_left_layout.setSpacing(8)
+        self._ld_center = QWidget()
+        self._ld_center_layout = QGridLayout(self._ld_center)
+        self._ld_center_layout.setContentsMargins(0, 0, 0, 0)
+        self._ld_center_layout.setSpacing(8)
+        self._ld_center_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self._ld_enc_right = QWidget()
+        self._ld_enc_right_layout = QVBoxLayout(self._ld_enc_right)
+        self._ld_enc_right_layout.setContentsMargins(0, 0, 0, 0)
+        self._ld_enc_right_layout.setSpacing(8)
+        _ld_main.addWidget(self._ld_enc_left)
+        _ld_main.addWidget(self._ld_center)
+        _ld_main.addWidget(self._ld_enc_right)
+        _ld_main.addStretch(1)
+        # Physical buttons row: b0-b7
+        self._ld_phys_row = QWidget()
+        self._ld_phys_layout = QHBoxLayout(self._ld_phys_row)
+        self._ld_phys_layout.setContentsMargins(0, 0, 0, 0)
+        self._ld_phys_layout.setSpacing(8)
+        self._ld_phys_layout.addStretch(1)
+        _ld_outer.addWidget(self._ld_main_row)
+        _ld_outer.addWidget(self._ld_phys_row)
+        _ld_outer.addStretch(1)
+        self.loupedeck_live_host.setVisible(False)
+        self.visual_layout.addWidget(self.loupedeck_live_host)
 
         self.grid_host = _VisualGridHost()
         self.grid_host.resized.connect(self._position_span_cards)
@@ -1277,6 +1377,18 @@ class EditorTab(QWidget):
         self.visual_deck_edit = QLineEdit()
         self.visual_deck_row = self.visual_deck_edit
         activation_form.addRow("Remote Deck", self.visual_deck_row)
+
+        self.visual_sweep_positions_edit = QPlainTextEdit()
+        self.visual_sweep_positions_edit.setFixedHeight(80)
+        self.visual_sweep_positions_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.visual_sweep_positions_edit.setPlaceholderText(
+            "sim/command/position_0\n"
+            "sim/command/position_1\n"
+            "# one command per stop, in order"
+        )
+        self.visual_sweep_positions_row = self.visual_sweep_positions_edit
+        activation_form.addRow("Positions", self.visual_sweep_positions_row)
+
         activation_layout.addLayout(activation_form)
 
         _activation_col = QWidget()
@@ -1590,6 +1702,7 @@ class EditorTab(QWidget):
         button_yaml_layout.addWidget(self.button_edit_editor, 1)
         self.button_edit_tabs.addTab(self.button_yaml_tab, "YAML")
         self.button_edit_tabs.addTab(self.button_advanced_tab, "Advanced")
+
         button_edit_layout.addWidget(self.button_edit_tabs, 1)
 
         for widget, signal_name in (
@@ -1603,6 +1716,7 @@ class EditorTab(QWidget):
             (self.visual_page_edit, "textChanged"),
             (self.visual_pages_edit, "textChanged"),
             (self.visual_deck_edit, "textChanged"),
+            (self.visual_sweep_positions_edit, "textChanged"),
             (self.visual_span_cols, "valueChanged"),
             (self.visual_span_rows, "valueChanged"),
             (self.visual_label_edit, "textChanged"),
@@ -1782,12 +1896,8 @@ class EditorTab(QWidget):
         self._update_action_state()
         return True
 
-    def _autosave_page(self) -> None:
-        if self._current_file_path is None or not self.editor.document().isModified():
-            return
-        self.save_current_file()
-
-    def _autosave_button(self) -> None:
+    def _apply_button_to_page(self) -> None:
+        """Apply the current button editor content to the in-memory page (no file write)."""
         if self._button_edit_id is None:
             return
         text = self.button_edit_editor.toPlainText()
@@ -1801,9 +1911,12 @@ class EditorTab(QWidget):
         if ok:
             self._button_edit_base_text = text
             self._button_doc.load_text(text)
-            self._page_autosave_timer.stop()
-            self.save_current_file()
             self._schedule_button_edit_preview()
+
+    def _save_current_and_apply_button(self) -> None:
+        """Explicit save: apply any pending button edit then write the file."""
+        self._apply_button_to_page()
+        self.save_current_file()
 
     def _collect_target_files(self, target_root: Path) -> list[Path]:
         allowed_suffixes = {".yaml", ".yml", ".json", ".txt", ".j2", ".css", ".js"}
@@ -2022,10 +2135,48 @@ class EditorTab(QWidget):
         if not raw_path:
             return
         path = Path(str(raw_path))
-        if self.editor.document().isModified():
-            self._page_autosave_timer.stop()
-            self.save_current_file()
+        if not self._confirm_discard_changes():
+            # Restore selection to the currently open file
+            self._restore_tree_selection()
+            return
         self._load_file(path)
+
+    def _confirm_discard_changes(self) -> bool:
+        """Return True if it's safe to navigate away (no unsaved changes, or user confirmed)."""
+        has_unsaved = self.editor.document().isModified()
+        if not has_unsaved:
+            return True
+        reply = QMessageBox.question(
+            self,
+            "Unsaved changes",
+            "You have unsaved changes. Discard them and open the new file?",
+            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if reply == QMessageBox.StandardButton.Save:
+            self._save_current_and_apply_button()
+            return True
+        if reply == QMessageBox.StandardButton.Discard:
+            return True
+        return False  # Cancel
+
+    def _restore_tree_selection(self) -> None:
+        """Re-select the currently open file in the tree after a cancelled navigation."""
+        if self._current_file_path is None or self._current_target_path is None:
+            return
+        rel = self._current_file_path.relative_to(self._current_target_path)
+        stack: list[QTreeWidgetItem] = [self.file_tree.invisibleRootItem()]
+        while stack:
+            node = stack.pop()
+            for i in range(node.childCount()):
+                child = node.child(i)
+                raw = child.data(0, Qt.ItemDataRole.UserRole)
+                if raw and Path(str(raw)) == rel:
+                    self.file_tree.blockSignals(True)
+                    self.file_tree.setCurrentItem(child)
+                    self.file_tree.blockSignals(False)
+                    return
+                stack.append(child)
 
     def _on_tree_item_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
         raw_path = item.data(0, Qt.ItemDataRole.UserRole)
@@ -2034,8 +2185,6 @@ class EditorTab(QWidget):
         target_path = self._current_target_path / str(raw_path)
         if self._current_file_path is None or target_path != self._current_file_path:
             return
-        if self.stack.currentWidget() is self.button_edit_page:
-            self._close_button_editor_workspace()
 
     def _load_file(self, path: Path) -> None:
         try:
@@ -2196,8 +2345,7 @@ class EditorTab(QWidget):
         if self._loading_file:
             return
         if modified:
-            self.modified_label.setText("Saving…")
-            self._page_autosave_timer.start(1000)
+            self.modified_label.setText("Unsaved changes")
         else:
             self.modified_label.setText("Saved")
             self._save_clear_timer.start(2000)
@@ -2225,6 +2373,7 @@ class EditorTab(QWidget):
         self.modified_label.setStyleSheet("font-size: 11px; color: #b45309; font-weight: 600;")
         self.status_label.setStyleSheet(f"font-size: 11px; color: {subfg};")
         self.visual_hint.setStyleSheet(f"font-size: 11px; color: {subfg};")
+        self.includes_bar_label.setStyleSheet(f"font-size: 11px; color: {subfg};")
         self.config_form_hint.setStyleSheet(f"font-size: 11px; color: {subfg};")
         self.designer_title.setStyleSheet(f"font-size: 12px; font-weight: 700; color: {fg};")
         self.selected_button_label.setStyleSheet(f"font-size: 11px; color: {fg};")
@@ -2247,6 +2396,7 @@ class EditorTab(QWidget):
             f"QPushButton:disabled {{ background: #e5e7eb; color: #94a3b8; border-color: {border}; }}"
             f"QPushButton:checked {{ background: #dbeafe; color: #1d4ed8; border-color: #93c5fd; }}"
         )
+        self._include_btn_style = button_style
         for btn in (
             self.btn_refresh,
             self.btn_reveal_target,
@@ -2351,6 +2501,17 @@ class EditorTab(QWidget):
             button_id = f"btn-{idx}"
             self._visual_buttons[button_id] = button
             self._visual_button_order.append(button_id)
+
+        deck_type = self._resolve_deck_type(self._current_file_path)
+        is_encoder_file = self._is_encoder_page(self._current_file_path)
+        self._loupedeck_live_mode = deck_type == "LoupedeckLive" and not is_encoder_file
+        self._loupedeck_encoder_mode = deck_type == "LoupedeckLive" and is_encoder_file
+        self._included_buttons = {}
+        if self._loupedeck_live_mode:
+            layout_dir = self._resolve_layout_dir(self._current_file_path)
+            if layout_dir is not None:
+                self._included_buttons = self._load_encoder_includes(data, layout_dir)
+
         self._visual_cols, self._visual_rows = self._infer_grid_dimensions(self._current_file_path, buttons)
         self._visual_enabled = True
         self.btn_visual_view.setEnabled(True)
@@ -2376,14 +2537,23 @@ class EditorTab(QWidget):
         self._preview_queue = []
         self._preview_queue_keys = set()
         self._effective_page_attrs_cache = {}
+        self._loupedeck_live_mode = False
+        self._loupedeck_encoder_mode = False
+        self._included_buttons = {}
         self.btn_visual_view.setEnabled(False)
+        self.includes_bar.setVisible(False)
+        self.loupedeck_live_host.setVisible(False)
+        self.grid_host.setVisible(True)
         self._refresh_selected_button_panel()
         self._rebuild_visual_widgets()
 
     def _resolve_visual_deck_name(self, page_path: Path | None) -> str | None:
         if page_path is None or self._current_target_path is None:
             return None
-        layout_id = page_path.parent.name
+        layout_dir = self._resolve_layout_dir(page_path)
+        if layout_dir is None:
+            return None
+        layout_id = layout_dir.name
         config_path = self._current_target_path / "deckconfig" / "config.yaml"
         try:
             cfg = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
@@ -2397,6 +2567,74 @@ class EditorTab(QWidget):
                 if name:
                     return name
         return None
+
+    def _resolve_layout_dir(self, file_path: Path | None) -> Path | None:
+        """Return the deck layout directory (direct child of deckconfig/) for any config file."""
+        if file_path is None or self._current_target_path is None:
+            return None
+        deckconfig = self._current_target_path / "deckconfig"
+        try:
+            rel = file_path.relative_to(deckconfig)
+        except ValueError:
+            return None
+        if not rel.parts:
+            return None
+        layout_dir = deckconfig / rel.parts[0]
+        return layout_dir if layout_dir.is_dir() else None
+
+    def _resolve_deck_type(self, file_path: Path | None) -> str | None:
+        """Return the Cockpitdecks deck type string (e.g. 'LoupedeckLive') for the given file."""
+        if self._current_target_path is None:
+            return None
+        layout_dir = self._resolve_layout_dir(file_path)
+        if layout_dir is None:
+            return None
+        layout_id = layout_dir.name
+        config_path = self._current_target_path / "deckconfig" / "config.yaml"
+        try:
+            cfg = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            return None
+        for deck in cfg.get("decks", []):
+            if not isinstance(deck, dict):
+                continue
+            if str(deck.get("layout") or "").strip() == layout_id:
+                return str(deck.get("type") or "").strip() or None
+        return None
+
+    def _load_encoder_includes(self, page_data: dict, layout_dir: Path) -> dict[str, tuple[dict, Path]]:
+        """Load encoder buttons from all encoder-subdirectory includes in page_data.
+
+        Returns a dict mapping button_id → (button_dict, source_path) for encoder buttons
+        found in include files.  Only includes whose resolved path is inside an 'encoders'
+        sub-directory are processed (to avoid loading page-level includes).
+        """
+        result: dict[str, tuple[dict, Path]] = {}
+        raw_includes = page_data.get("includes")
+        if isinstance(raw_includes, str):
+            include_names = [p.strip() for p in raw_includes.split(",") if p.strip()]
+        elif isinstance(raw_includes, list):
+            include_names = [str(p).strip() for p in raw_includes if str(p).strip()]
+        else:
+            return result
+        for name in include_names:
+            inc_path = layout_dir / f"{name}.yaml"
+            if not inc_path.is_file():
+                continue
+            if "encoders" not in inc_path.parts:
+                continue  # skip non-encoder includes (e.g. pager)
+            try:
+                inc_data = yaml.safe_load(inc_path.read_text(encoding="utf-8")) or {}
+            except Exception:
+                continue
+            if not isinstance(inc_data, dict):
+                continue
+            for idx, btn in enumerate(inc_data.get("buttons") or []):
+                if not isinstance(btn, dict):
+                    continue
+                button_id = f"inc-{name.replace('/', '-')}-{idx}"
+                result[button_id] = (btn, inc_path)
+        return result
 
     def _is_layout_config_file(self, path: Path | None) -> bool:
         if path is None or path.name != "config.yaml":
@@ -2469,11 +2707,21 @@ class EditorTab(QWidget):
         if isinstance(value, int):
             return value
         if isinstance(value, str):
+            v = value.strip()
+            # encoder slot: e0, e1, e2, …
+            if len(v) >= 2 and v[0].lower() == "e" and v[1:].isdigit():
+                return int(v[1:])
             try:
-                return int(value.strip())
+                return int(v)
             except ValueError:
                 return None
         return None
+
+    def _is_encoder_page(self, path: Path | None) -> bool:
+        """Return True if *path* lives inside an 'encoders' subdirectory."""
+        if path is None:
+            return False
+        return any(part.lower() == "encoders" for part in path.parts)
 
     def _button_name(self, button: dict) -> str:
         if not isinstance(button, dict):
@@ -2552,7 +2800,11 @@ class EditorTab(QWidget):
         return context
 
     def _button_preview_config(self, button_id: str) -> dict:
-        button = dict(self._visual_buttons.get(button_id, {}))
+        button = self._visual_buttons.get(button_id)
+        if button is None:
+            included = self._included_buttons.get(button_id)
+            button = included[0] if included is not None else {}
+        button = dict(button)
         effective_attrs = self._effective_page_attrs_cache or self._effective_page_attributes()
         for key, value in effective_attrs.items():
             button.setdefault(key, value)
@@ -2703,6 +2955,7 @@ class EditorTab(QWidget):
         is_command_like = action_type in {"push", "begin-end-command"}
         is_two_command = action_type in {"encoder-toggle", "short-or-long-press"}
         uses_remote_deck = action_type in {"page", "reload"}
+        is_sweep = action_type == "sweep"
         is_annunciator = style == "annunciator"
         is_gauge = style == "gauge"
 
@@ -2711,6 +2964,7 @@ class EditorTab(QWidget):
         _set_form_row_visible(self.visual_activation_form, self.visual_page_row, is_page)
         _set_form_row_visible(self.visual_activation_form, self.visual_pages_row, is_page_cycle)
         _set_form_row_visible(self.visual_activation_form, self.visual_deck_row, uses_remote_deck)
+        _set_form_row_visible(self.visual_activation_form, self.visual_sweep_positions_row, is_sweep)
 
         if action_type == "encoder-toggle":
             self.visual_command1_label.setText("On")
@@ -2759,18 +3013,25 @@ class EditorTab(QWidget):
         data = dict(self._button_doc.current_data or {})
         self._button_visual_syncing = True
         try:
-            action_type = str(data.get("activation") or "push")
+            activation_cfg = data.get("activation") if isinstance(data.get("activation"), dict) else {}
+            representation_cfg = data.get("representation") if isinstance(data.get("representation"), dict) else {}
+            action_type = str(activation_cfg.get("type") or data.get("activation") or "push")
             family = self._activation_family_for_type(action_type)
             self._set_visual_combo_value(self.visual_activation_family_combo, family)
             self._populate_activation_subtypes(action_type)
             self._set_visual_combo_value(self.visual_type_combo, action_type)
 
-            ann = data.get("annunciator")
-            gauge = data.get("gauge")
-            if isinstance(ann, dict):
+            ann = representation_cfg.get("annunciator") if isinstance(representation_cfg.get("annunciator"), dict) else representation_cfg if str(representation_cfg.get("type") or "") == "annunciator" else data.get("annunciator")
+            gauge = representation_cfg.get("gauge") if isinstance(representation_cfg.get("gauge"), dict) else representation_cfg if str(representation_cfg.get("type") or "") == "gauge" else data.get("gauge")
+            rep_type = str(representation_cfg.get("type") or data.get("representation") or "")
+            if rep_type == "side-display":
+                style = "side-display"
+            elif isinstance(ann, dict):
                 style = "annunciator"
             elif isinstance(gauge, dict):
                 style = "gauge"
+            elif rep_type in _known_visual_representation_styles():
+                style = rep_type
             else:
                 style = "standard"
             rep_family = self._representation_family_for_style(style)
@@ -2778,7 +3039,7 @@ class EditorTab(QWidget):
             self._populate_representation_subtypes(style)
             self._set_visual_combo_value(self.visual_style_combo, style)
 
-            cmds = data.get("commands") or {}
+            cmds = activation_cfg.get("commands") if isinstance(activation_cfg.get("commands"), dict) else data.get("commands") or {}
             self.visual_command_edit.setText(str(cmds.get("press") or ""))
             command1 = ""
             command2 = ""
@@ -2788,16 +3049,18 @@ class EditorTab(QWidget):
                 command2 = str(cmds.get(pair_fields[1]) or "")
             self.visual_command1_edit.setText(command1)
             self.visual_command2_edit.setText(command2)
-            self.visual_page_edit.setText(str(data.get("page") or ""))
-            pages = data.get("pages") if isinstance(data.get("pages"), list) else []
+            self.visual_page_edit.setText(str(activation_cfg.get("page") or data.get("page") or ""))
+            pages = activation_cfg.get("pages") if isinstance(activation_cfg.get("pages"), list) else data.get("pages") if isinstance(data.get("pages"), list) else []
             self.visual_pages_edit.setText(", ".join(str(page).strip() for page in pages if str(page).strip()))
             self.visual_deck_edit.setText(str(data.get("deck") or ""))
-            self.visual_label_edit.setText(str(data.get("label") or ""))
-            self.visual_label_size.setValue(int(data.get("label-size") or 0))
-            self.visual_label_color_edit.setText(str(data.get("label-color") or ""))
-            self.visual_text_edit.setText(str(data.get("text") or ""))
-            self.visual_text_size.setValue(int(data.get("text-size") or 0))
-            self.visual_text_color_edit.setText(str(data.get("text-color") or ""))
+            positions = activation_cfg.get("positions") if isinstance(activation_cfg.get("positions"), list) else []
+            self.visual_sweep_positions_edit.setPlainText("\n".join(str(p) for p in positions))
+            self.visual_label_edit.setText(str(representation_cfg.get("label") or data.get("label") or ""))
+            self.visual_label_size.setValue(int(representation_cfg.get("label-size") or data.get("label-size") or 0))
+            self.visual_label_color_edit.setText(str(representation_cfg.get("label-color") or data.get("label-color") or ""))
+            self.visual_text_edit.setText(str(representation_cfg.get("text") or data.get("text") or ""))
+            self.visual_text_size.setValue(int(representation_cfg.get("text-size") or data.get("text-size") or 0))
+            self.visual_text_color_edit.setText(str(representation_cfg.get("text-color") or data.get("text-color") or ""))
 
             ann_model = "B"
             part_texts: dict[str, str] = {}
@@ -2879,57 +3142,82 @@ class EditorTab(QWidget):
         if self._button_visual_syncing:
             return
         sender = self.sender()
-        previous_type = str((self._button_doc.current_data or {}).get("activation") or "push")
+        current_data = dict(self._button_doc.current_data or {})
+        current_activation = current_data.get("activation") if isinstance(current_data.get("activation"), dict) else {}
+        current_representation = current_data.get("representation") if isinstance(current_data.get("representation"), dict) else {}
+        previous_type = str(current_activation.get("type") or current_data.get("activation") or "push")
         if sender is self.visual_activation_family_combo:
             self._populate_activation_subtypes()
         elif sender is self.visual_representation_family_combo:
             self._populate_representation_subtypes()
         self._update_visual_field_visibility()
-        data = dict(self._button_doc.current_data or {})
+        data = {
+            key: value
+            for key, value in current_data.items()
+            if key not in {
+                "activation",
+                "representation",
+                "commands",
+                "page",
+                "pages",
+                "label",
+                "label-size",
+                "label-color",
+                "text",
+                "text-size",
+                "text-color",
+                "formula",
+                "annunciator",
+                "gauge",
+            }
+        }
 
-        def _set_or_del(key: str, value: str | int) -> None:
+        def _set_or_del(target: dict, key: str, value: str | int) -> None:
             if isinstance(value, int):
                 if value > 0:
-                    data[key] = value
+                    target[key] = value
                 else:
-                    data.pop(key, None)
+                    target.pop(key, None)
                 return
             if str(value).strip():
-                data[key] = str(value).strip()
+                target[key] = str(value).strip()
             else:
-                data.pop(key, None)
+                target.pop(key, None)
 
         action_type = str(self.visual_type_combo.currentData() or self.visual_type_combo.currentText())
-        _set_or_del("activation", action_type)
-        _set_or_del("page", self.visual_page_edit.text())
-        _set_or_del("deck", self.visual_deck_edit.text())
-        _set_or_del("label", self.visual_label_edit.text())
-        _set_or_del("label-size", self.visual_label_size.value())
-        _set_or_del("text", self.visual_text_edit.text())
-        _set_or_del("text-size", self.visual_text_size.value())
-        _set_or_del("text-color", self.visual_text_color_edit.text())
+        _set_or_del(data, "deck", self.visual_deck_edit.text())
 
         if action_type != previous_type:
             pair_fields = _two_command_fields(action_type)
             if action_type == "encoder-toggle" and pair_fields is not None:
-                label = str(data.get("label") or data.get("text") or data.get("name") or "BUTTON").strip().upper()
-                cmds = dict(data.get("commands") or {})
+                label = str(
+                    current_representation.get("label")
+                    or current_representation.get("text")
+                    or data.get("name")
+                    or "BUTTON"
+                ).strip().upper()
+                cmds = dict(current_activation.get("commands") or {})
                 cmds.setdefault(pair_fields[0], f"sim/none/{label.lower()}_on")
                 cmds.setdefault(pair_fields[1], f"sim/none/{label.lower()}_off")
-                data["commands"] = cmds
+                current_activation["commands"] = cmds
             elif action_type == "short-or-long-press" and pair_fields is not None:
-                label = str(data.get("label") or data.get("text") or data.get("name") or "BUTTON").strip().upper()
-                cmds = dict(data.get("commands") or {})
+                label = str(
+                    current_representation.get("label")
+                    or current_representation.get("text")
+                    or data.get("name")
+                    or "BUTTON"
+                ).strip().upper()
+                cmds = dict(current_activation.get("commands") or {})
                 cmds.setdefault(pair_fields[0], f"sim/none/{label.lower()}_short")
                 cmds.setdefault(pair_fields[1], f"sim/none/{label.lower()}_long")
-                data["commands"] = cmds
-            elif action_type == "page" and not str(data.get("page") or "").strip():
-                data["page"] = "index"
-            elif action_type == "page-cycle" and not isinstance(data.get("pages"), list):
-                data["pages"] = ["index", "page2"]
+                current_activation["commands"] = cmds
+            elif action_type == "page" and not str(current_activation.get("page") or "").strip():
+                current_activation["page"] = "index"
+            elif action_type == "page-cycle" and not isinstance(current_activation.get("pages"), list):
+                current_activation["pages"] = ["index", "page2"]
 
         # Write commands dict — build from current UI state
-        cmds = dict(data.get("commands") or {})
+        cmds = dict(current_activation.get("commands") or {})
         pair_fields = _two_command_fields(action_type)
         if pair_fields is not None:
             command1 = self.visual_command1_edit.text().strip()
@@ -2949,30 +3237,92 @@ class EditorTab(QWidget):
                 cmds["press"] = press_cmd
             else:
                 cmds.pop("press", None)
+        activation_obj = {k: v for k, v in current_activation.items() if k not in {"type", "commands", "page", "pages", "positions"}}
+        activation_obj["type"] = action_type
         if cmds:
-            data["commands"] = cmds
-        else:
-            data.pop("commands", None)
+            activation_obj["commands"] = cmds
 
         if action_type == "page-cycle":
             pages = [part.strip() for part in self.visual_pages_edit.text().split(",") if part.strip()]
             if pages:
-                data["pages"] = pages
+                activation_obj["pages"] = pages
             else:
-                data.pop("pages", None)
+                activation_obj.pop("pages", None)
         else:
-            data.pop("pages", None)
+            activation_obj.pop("pages", None)
+        page_name = self.visual_page_edit.text().strip()
+        if page_name:
+            activation_obj["page"] = page_name
+        else:
+            activation_obj.pop("page", None)
+        if action_type == "sweep":
+            raw_positions = [ln.strip() for ln in self.visual_sweep_positions_edit.toPlainText().splitlines() if ln.strip() and not ln.strip().startswith("#")]
+            if raw_positions:
+                activation_obj["positions"] = raw_positions
+        data["activation"] = activation_obj
 
         style = str(self.visual_style_combo.currentData() or "standard")
+        managed_representation_keys = {
+            "type",
+            "label",
+            "label-size",
+            "label-color",
+            "text",
+            "text-size",
+            "text-color",
+            "formula",
+            "annunciator",
+            "gauge",
+            "data",
+            "switch",
+            "push-switch",
+            "circular-switch",
+            "knob",
+            "side-display",
+            "side",
+        }
+        representation_obj = {
+            key: value for key, value in current_representation.items() if key not in managed_representation_keys
+        }
         if style == "gauge":
-            _set_or_del("label-color", self.visual_label_color_edit.text())
+            representation_obj["type"] = "gauge"
+            _set_or_del(representation_obj, "label-color", self.visual_label_color_edit.text())
+            _set_or_del(representation_obj, "label", self.visual_label_edit.text())
+            _set_or_del(representation_obj, "label-size", self.visual_label_size.value())
+            _set_or_del(representation_obj, "text", "")
+            _set_or_del(representation_obj, "text-size", 0)
+            _set_or_del(representation_obj, "text-color", "")
+        elif style == "annunciator":
+            representation_obj["type"] = "annunciator"
+            _set_or_del(representation_obj, "label", self.visual_label_edit.text())
+            _set_or_del(representation_obj, "label-size", self.visual_label_size.value())
+            _set_or_del(representation_obj, "label-color", self.visual_label_color_edit.text())
         else:
-            data.pop("label-color", None)
+            _set_or_del(representation_obj, "label", self.visual_label_edit.text())
+            _set_or_del(representation_obj, "label-size", self.visual_label_size.value())
+            _set_or_del(representation_obj, "label-color", self.visual_label_color_edit.text())
+            _set_or_del(representation_obj, "text", self.visual_text_edit.text())
+            _set_or_del(representation_obj, "text-size", self.visual_text_size.value())
+            _set_or_del(representation_obj, "text-color", self.visual_text_color_edit.text())
+            _STYLE_REP = {
+                "standard": "icon-color",
+                "text": "text",
+                "data": "data",
+                "switch": "switch",
+                "push-switch": "push-switch",
+                "circular-switch": "circular-switch",
+                "knob": "knob",
+                "side-display": "side-display",
+            }
+            rep_type = _STYLE_REP.get(style, "icon-color")
+            representation_obj["type"] = rep_type
+            if rep_type in {"data", "switch", "push-switch", "circular-switch", "knob", "side"}:
+                existing_payload = current_representation.get(rep_type)
+                if existing_payload is not None:
+                    representation_obj[rep_type] = existing_payload
+
         if style == "annunciator":
-            data.pop("text", None)
-            data.pop("text-size", None)
-            data.pop("text-color", None)
-            ann = dict(data.get("annunciator") or {})
+            ann = dict(current_representation.get("annunciator") or {})
             ann["model"] = str(self.visual_ann_model.currentData() or self.visual_ann_model.currentText() or "B")
             ann_style = str(self.visual_ann_style.currentData() or "").strip()
             if ann_style:
@@ -3036,16 +3386,11 @@ class EditorTab(QWidget):
                 ann["parts"] = parts_list
             else:
                 ann.pop("parts", None)
-            data["annunciator"] = ann
+            representation_obj["annunciator"] = ann
         else:
-            data.pop("annunciator", None)
+            representation_obj.pop("annunciator", None)
 
         if style == "gauge":
-            data.pop("text", None)
-            data.pop("text-size", None)
-            data.pop("text-color", None)
-            data.pop("annunciator", None)
-
             def _int_or_del(d: dict, key: str, val: int, default: int) -> None:
                 if val != default:
                     d[key] = val
@@ -3058,7 +3403,7 @@ class EditorTab(QWidget):
                 else:
                     d.pop(key, None)
 
-            g = dict(data.get("gauge") or {})
+            g = dict(current_representation.get("gauge") or {})
             g["tick-from"] = self.visual_gauge_tick_from.value()
             g["tick-to"] = self.visual_gauge_tick_to.value()
             g["ticks"] = self.visual_gauge_ticks.value()
@@ -3094,16 +3439,17 @@ class EditorTab(QWidget):
             else:
                 g.pop("tick-labels", None)
             if g:
-                data["gauge"] = g
+                representation_obj["gauge"] = g
             else:
-                data.pop("gauge", None)
+                representation_obj.pop("gauge", None)
             formula = self.visual_gauge_formula_edit.text().strip()
             if formula:
-                data["formula"] = formula
+                representation_obj["formula"] = formula
             else:
-                data.pop("formula", None)
+                representation_obj.pop("formula", None)
         else:
-            data.pop("gauge", None)
+            representation_obj.pop("gauge", None)
+            representation_obj.pop("formula", None)
 
         sc = self.visual_span_cols.value()
         sr = self.visual_span_rows.value()
@@ -3111,6 +3457,8 @@ class EditorTab(QWidget):
             data["span"] = [sc, sr]
         else:
             data.pop("span", None)
+
+        data["representation"] = representation_obj
 
         self._button_doc.set_current_data(data)
         self._loading_file = True
@@ -3120,7 +3468,7 @@ class EditorTab(QWidget):
             self._loading_file = False
         self._schedule_button_edit_preview()
         self._update_advanced_preview()
-        self._button_autosave_timer.start(600)
+        self._apply_button_to_page()
         self._update_action_state()
 
     def _on_button_yaml_text_changed(self) -> None:
@@ -3130,7 +3478,7 @@ class EditorTab(QWidget):
         if ok:
             self._sync_visual_fields_from_doc()
         self._schedule_button_edit_preview()
-        self._button_autosave_timer.start(600)
+        self._apply_button_to_page()
         self._update_action_state()
 
     def _update_preset_preview(self) -> None:
@@ -3292,16 +3640,24 @@ class EditorTab(QWidget):
         return self.button_edit_editor.toPlainText() != self._button_edit_base_text
 
     def _queue_visible_previews(self) -> None:
-        if not self._visual_enabled or self._visual_cols <= 0:
+        if not self._visual_enabled:
+            return
+        if not self._loupedeck_live_mode and self._visual_cols <= 0:
             return
         target_root = self._current_target_path
         if target_root is None:
             return
         target_key = str(target_root.resolve())
         if target_key not in self._preview_ready_targets:
-            self.visual_hint.setText(
-                f"Grid {self._visual_cols}×{self._visual_rows}. Warming preview engine before rendering visible buttons…"
-            )
+            if not self._loupedeck_live_mode:
+                self.visual_hint.setText(
+                    f"Grid {self._visual_cols}×{self._visual_rows}. Warming preview engine before rendering visible buttons…"
+                )
+            return
+        if self._loupedeck_live_mode or self._loupedeck_encoder_mode:
+            # All cards are always visible in the LD Live layout — queue them all
+            for button_id in self._visible_cards:
+                self._ensure_button_preview(button_id)
             return
         row_height = max(1, int(128 * self._visual_zoom) + 8)
         viewport_h = max(1, self.visual_scroll.viewport().height())
@@ -3323,23 +3679,35 @@ class EditorTab(QWidget):
                 self._ensure_button_preview(button_id)
 
     def _infer_grid_dimensions(self, page_path: Path, buttons: list[dict]) -> tuple[int, int]:
+        # Encoder pages use eN indexes (mapped to ints 0..N-1) — show as a single row.
+        if self._is_encoder_page(page_path):
+            n = max(1, sum(1 for btn in buttons if isinstance(btn, dict) and self._button_index(btn) is not None))
+            return n, 1
+
+        def _builtin_grid(deck_type: str | None) -> tuple[int, int] | None:
+            if not deck_type:
+                return None
+            normalized = " ".join(str(deck_type).strip().lower().split())
+            if normalized in {"stream deck xl", "virtual streamdeck xl", "virtual stream deck xl"}:
+                return 8, 4
+            if normalized in {"stream deck original", "streamdeck", "virtual streamdeck", "virtual stream deck"}:
+                return 5, 3
+            if normalized in {"stream deck mini", "virtual stream deck mini", "virtual streamdeck mini"}:
+                return 3, 2
+            return None
+
         max_index = max((int(btn.get("index", -1)) for btn in buttons if isinstance(btn, dict) and isinstance(btn.get("index"), int)), default=-1)
+        layout_dir = self._resolve_layout_dir(page_path)
+        layout_id = layout_dir.name if layout_dir is not None else page_path.parent.name
+        deck_type = self._resolve_deck_type(page_path)
         target_root = self._current_target_path
         if target_root is not None:
-            config_path = target_root / "deckconfig" / "config.yaml"
             type_dir = target_root / "deckconfig" / "resources" / "decks" / "types"
-            try:
-                cfg = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-                layout_id = page_path.parent.name
-                for deck in cfg.get("decks", []):
-                    if not isinstance(deck, dict) or deck.get("layout") != layout_id:
-                        continue
-                    type_name = deck.get("type")
-                    if not type_name or not type_dir.is_dir():
-                        break
+            if deck_type and type_dir.is_dir():
+                try:
                     for type_file in sorted(type_dir.glob("*.y*ml")):
                         tcfg = yaml.safe_load(type_file.read_text(encoding="utf-8")) or {}
-                        if tcfg.get("name") != type_name:
+                        if tcfg.get("name") != deck_type:
                             continue
                         defs = tcfg.get("buttons") or []
                         if defs and isinstance(defs[0], dict):
@@ -3348,9 +3716,16 @@ class EditorTab(QWidget):
                                 cols = int(repeat[0])
                                 rows = int(repeat[1])
                                 return max(cols, 1), max(rows, 1)
-            except Exception:
-                pass
+                except Exception:
+                    pass
+
+        builtin_grid = _builtin_grid(deck_type)
+        if builtin_grid is not None:
+            return builtin_grid
+
         if max_index < 0:
+            if layout_id.lower().startswith("streamdeckxl"):
+                return 8, 4
             return 6, 4
         total = max_index + 1
         if total <= 12:
@@ -3385,11 +3760,75 @@ class EditorTab(QWidget):
         self._visible_named_cards = {}
         self._span_card_specs = {}
 
+        # ── Includes navigation bar ──────────────────────────────────────────
+        # Remove any previously added include buttons (keep label + stretch only)
+        while self.includes_bar_layout.count() > 2:
+            item = self.includes_bar_layout.takeAt(1)
+            if item.widget():
+                item.widget().deleteLater()
+
+        include_names: list[str] = []
+        if self._current_file_path is not None:
+            try:
+                page_data = yaml.safe_load(self.editor.toPlainText()) or {}
+            except Exception:
+                page_data = {}
+            raw_includes = page_data.get("includes") if isinstance(page_data, dict) else None
+            if isinstance(raw_includes, str):
+                include_names = [p.strip() for p in raw_includes.split(",") if p.strip()]
+            elif isinstance(raw_includes, list):
+                include_names = [str(p).strip() for p in raw_includes if str(p).strip()]
+
+        if include_names and self._current_file_path is not None:
+            layout_dir = self._current_file_path.parent
+            for name in include_names:
+                inc_path = layout_dir / f"{name}.yaml"
+                btn = QPushButton(name)
+                btn.setToolTip(str(inc_path))
+                btn.setEnabled(inc_path.is_file())
+                btn.setProperty("include_path", str(inc_path))
+                if self._include_btn_style:
+                    btn.setStyleSheet(self._include_btn_style)
+
+                def _open_include(checked=False, _p=inc_path):
+                    if not self._confirm_discard_changes():
+                        return
+                    self._load_file(_p)
+
+                btn.clicked.connect(_open_include)
+                # Insert before the trailing stretch (index = count-1)
+                self.includes_bar_layout.insertWidget(self.includes_bar_layout.count() - 1, btn)
+            self.includes_bar.setVisible(True)
+        else:
+            self.includes_bar.setVisible(False)
+
         if not self._visual_enabled:
+            self.loupedeck_live_host.setVisible(False)
+            self.grid_host.setVisible(True)
             self.visual_hint.setText("Visual mode is available for YAML page files with a `buttons:` list.")
             return
 
-        self.visual_hint.setText(f"Grid {self._visual_cols}×{self._visual_rows}. Drag to move buttons. Drop on an occupied slot to swap.")
+        if self._loupedeck_live_mode:
+            self.grid_host.setVisible(False)
+            self.loupedeck_live_host.setVisible(True)
+            self.visual_hint.setText("Loupedeck Live layout. Click a button card to select and edit it.")
+            self.zoom_label.setText(f"{int(round(self._visual_zoom * 100))}%")
+            self._rebuild_loupedeck_live_widgets()
+            QTimer.singleShot(0, self._queue_visible_previews)
+            return
+        if self._loupedeck_encoder_mode:
+            self.grid_host.setVisible(False)
+            self.loupedeck_live_host.setVisible(True)
+            self.visual_hint.setText("Loupedeck Live encoder include. Only encoder side displays and knobs are editable here.")
+            self.zoom_label.setText(f"{int(round(self._visual_zoom * 100))}%")
+            self._rebuild_loupedeck_encoder_widgets()
+            QTimer.singleShot(0, self._queue_visible_previews)
+            return
+
+        self.loupedeck_live_host.setVisible(False)
+        self.grid_host.setVisible(True)
+        hint = "Encoders" if self._is_encoder_page(self._current_file_path) else f"Grid {self._visual_cols}×{self._visual_rows}"
+        self.visual_hint.setText(f"{hint}. Drag to move buttons. Drop on an occupied slot to swap.")
         self.zoom_label.setText(f"{int(round(self._visual_zoom * 100))}%")
         print(f"DEBUG: _rebuild_visual_widgets starting for {self._visual_cols}x{self._visual_rows}")
 
@@ -3520,11 +3959,11 @@ class EditorTab(QWidget):
         self.grid_layout.setColumnStretch(self._visual_cols, 1)
         self.grid_layout.setRowStretch(self._visual_rows, 1)
 
-        # ── Named-slot buttons (legacy string indices) ────────────────────────
+        # ── Named-slot buttons (no resolvable integer index) ─────────────────
         named_buttons = [
             (button_id, button)
             for button_id, button in self._visual_buttons.items()
-            if isinstance(button.get("index"), str) and not button.get("index", "").strip().lstrip("-").isdigit()
+            if self._button_index(button) is None
         ]
         if named_buttons:
             extra_row = self._visual_rows + 1
@@ -3646,7 +4085,250 @@ class EditorTab(QWidget):
         self._selected_button_id = button_id
         self._apply_selection_highlights()
         self._refresh_selected_button_panel()
-        self._open_button_editor_workspace(button_id)
+        self._send_to_designer(button_id=button_id)
+
+    def _rebuild_loupedeck_live_widgets(self) -> None:
+        """Build the Loupedeck Live hardware-faithful layout.
+
+        Layout (same structure regardless of whether a page file or encoder file is open):
+          [enc left col: e0,e1,e2]  [center 4×3 grid: 0-11]  [enc right col: e3,e4,e5]
+          [physical buttons row: b0-b7]
+
+        Encoder buttons come from _visual_buttons (when editing an encoder file) or
+        from _included_buttons (when editing a page file that includes encoders).
+        Center and physical buttons come from _visual_buttons.
+        """
+        tile_px = int(128 * self._visual_zoom)
+        phys_px = int(72 * self._visual_zoom)
+        # Side-strip cards are narrower than center tiles to reflect the physical device.
+        side_w = max(52, int(tile_px * 0.58))
+        side_h = tile_px
+
+        # ── Clear previous LD Live widgets ──────────────────────────────────
+        def _clear_layout(layout) -> None:
+            while layout.count():
+                item = layout.takeAt(0)
+                w = item.widget()
+                if w:
+                    w.deleteLater()
+
+        _clear_layout(self._ld_enc_left_layout)
+        _clear_layout(self._ld_enc_right_layout)
+        _clear_layout(self._ld_center_layout)
+        _clear_layout(self._ld_phys_layout)
+        self._ld_phys_layout.addStretch(1)
+
+        # ── Build index → button_id maps ────────────────────────────────────
+        # Center buttons: integer index 0-11 from _visual_buttons
+        center_by_index: dict[int, str] = {}
+        for bid, btn in self._visual_buttons.items():
+            raw = btn.get("index")
+            if isinstance(raw, int):
+                center_by_index[raw] = bid
+            elif isinstance(raw, str):
+                v = raw.strip()
+                if v.isdigit():
+                    center_by_index[int(v)] = bid
+
+        # Physical buttons: bN index from _visual_buttons
+        phys_by_index: dict[int, str] = {}
+        for bid, btn in self._visual_buttons.items():
+            raw = btn.get("index")
+            if isinstance(raw, str):
+                v = raw.strip()
+                if len(v) >= 2 and v[0].lower() == "b" and v[1:].isdigit():
+                    phys_by_index[int(v[1:])] = bid
+
+        # Encoder buttons: eN from _visual_buttons (encoder file) or _included_buttons (page file)
+        enc_by_index: dict[int, tuple[str, dict, Path | None]] = {}
+        for bid, btn in self._visual_buttons.items():
+            raw = btn.get("index")
+            if isinstance(raw, str):
+                v = raw.strip()
+                if len(v) >= 2 and v[0].lower() == "e" and v[1:].isdigit():
+                    enc_by_index[int(v[1:])] = (bid, btn, None)
+        for bid, (btn, src_path) in self._included_buttons.items():
+            raw = btn.get("index")
+            if isinstance(raw, str):
+                v = raw.strip()
+                if len(v) >= 2 and v[0].lower() == "e" and v[1:].isdigit():
+                    n = int(v[1:])
+                    if n not in enc_by_index:  # don't override file-local encoders
+                        enc_by_index[n] = (bid, btn, src_path)
+
+        def _make_card(button_id: str, btn: dict, *, width: int, height: int, source_file: Path | None = None) -> _VisualButtonCard:
+            card = _VisualButtonCard(
+                button_id,
+                btn,
+                dark=self._dark_mode,
+                scale=max(width, height) / 118.0,
+                preview=self._preview_cache.get(self._preview_key(button_id)),
+                preview_status=self._preview_errors.get(self._preview_key(button_id)),
+            )
+            card.setMinimumSize(width, height)
+            card.setMaximumSize(width, height)
+            card.resize(width, height)
+            if source_file is not None:
+                # Include-sourced: clicking navigates to the include file
+                def _open_src(checked=False, _sf=source_file):
+                    if not self._confirm_discard_changes():
+                        return
+                    self._load_file(_sf)
+                card.selected.connect(lambda bid, _sf=source_file: None)  # no-op selection
+                card.edit_requested.connect(_open_src)
+                card.context_requested.connect(lambda bid, pos: None)  # no-op
+            else:
+                card.selected.connect(self._set_selected_visual_button)
+                card.edit_requested.connect(self._select_visual_button)
+                card.context_requested.connect(self._show_button_context_menu)
+            # All cards go into _visible_cards so the preview system can queue and refresh them.
+            self._visible_cards[button_id] = card
+            return card
+
+        def _make_slot_label(label: str, *, width: int, height: int, muted: bool = False) -> QLabel:
+            lbl = QLabel(label)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setFixedSize(width, height)
+            border = "#cbd5e1" if not muted else "#e2e8f0"
+            fg = "#94a3b8" if not muted else "#cbd5e1"
+            bg = "#f8fafc" if not muted else "#f1f5f9"
+            lbl.setStyleSheet(
+                f"QLabel {{ border: 1px dashed {border}; border-radius: 6px; "
+                f"color: {fg}; font-size: 11px; background: {bg}; }}"
+            )
+            return lbl
+
+        # ── Left encoder column (e0, e1, e2) ────────────────────────────────
+        for n in range(3):
+            if n in enc_by_index:
+                bid, btn, src = enc_by_index[n]
+                card = _make_card(bid, btn, width=side_w, height=side_h, source_file=src)
+                self._ld_enc_left_layout.addWidget(card)
+            else:
+                self._ld_enc_left_layout.addWidget(_make_slot_label(f"e{n}", width=side_w, height=side_h))
+
+        # ── Center 4×3 grid (buttons 0-11) ──────────────────────────────────
+        for row in range(3):
+            self._ld_center_layout.setRowMinimumHeight(row, tile_px)
+            for col in range(4):
+                index = row * 4 + col
+                self._ld_center_layout.setColumnMinimumWidth(col, tile_px)
+                if index in center_by_index:
+                    bid = center_by_index[index]
+                    btn = self._visual_buttons[bid]
+                    card = _make_card(bid, btn, width=tile_px, height=tile_px)
+                    self._ld_center_layout.addWidget(card, row, col)
+                else:
+                    slot = _GridSlot(index, dark=self._dark_mode, scale=self._visual_zoom)
+                    slot.create_requested.connect(self._create_new_button_at_index)
+                    slot.deselect_requested.connect(self._clear_visual_selection)
+                    self._ld_center_layout.addWidget(slot, row, col)
+                    self._visible_cell_slots[(row, col)] = slot
+
+        # ── Right encoder column (e3, e4, e5) ───────────────────────────────
+        for n in range(3, 6):
+            if n in enc_by_index:
+                bid, btn, src = enc_by_index[n]
+                card = _make_card(bid, btn, width=side_w, height=side_h, source_file=src)
+                self._ld_enc_right_layout.addWidget(card)
+            else:
+                self._ld_enc_right_layout.addWidget(_make_slot_label(f"e{n}", width=side_w, height=side_h))
+
+        # ── Physical buttons row (b0-b7) ─────────────────────────────────────
+        phys_labels = ["●", "1", "2", "3", "4", "5", "6", "7"]
+        for n in range(8):
+            if n in phys_by_index:
+                bid = phys_by_index[n]
+                btn = self._visual_buttons[bid]
+                card = _make_card(bid, btn, width=phys_px, height=phys_px)
+                self._ld_phys_layout.insertWidget(self._ld_phys_layout.count() - 1, card)
+            else:
+                lbl = _make_slot_label(phys_labels[n], width=phys_px, height=phys_px, muted=True)
+                self._ld_phys_layout.insertWidget(self._ld_phys_layout.count() - 1, lbl)
+
+    def _rebuild_loupedeck_encoder_widgets(self) -> None:
+        """Build a contextual Loupedeck skeleton for encoder include files."""
+        tile_px = int(128 * self._visual_zoom)
+        phys_px = int(72 * self._visual_zoom)
+        side_w = max(52, int(tile_px * 0.58))
+        side_h = tile_px
+
+        def _clear_layout(layout) -> None:
+            while layout.count():
+                item = layout.takeAt(0)
+                w = item.widget()
+                if w:
+                    w.deleteLater()
+
+        _clear_layout(self._ld_enc_left_layout)
+        _clear_layout(self._ld_enc_right_layout)
+        _clear_layout(self._ld_center_layout)
+        _clear_layout(self._ld_phys_layout)
+        self._ld_phys_layout.addStretch(1)
+
+        enc_by_index: dict[int, tuple[str, dict]] = {}
+        for bid, btn in self._visual_buttons.items():
+            raw = btn.get("index")
+            if isinstance(raw, str):
+                v = raw.strip()
+                if len(v) >= 2 and v[0].lower() == "e" and v[1:].isdigit():
+                    enc_by_index[int(v[1:])] = (bid, btn)
+
+        def _make_card(button_id: str, btn: dict, *, width: int, height: int) -> _VisualButtonCard:
+            card = _VisualButtonCard(
+                button_id,
+                btn,
+                dark=self._dark_mode,
+                scale=max(width, height) / 118.0,
+                preview=self._preview_cache.get(self._preview_key(button_id)),
+                preview_status=self._preview_errors.get(self._preview_key(button_id)),
+            )
+            card.setMinimumSize(width, height)
+            card.setMaximumSize(width, height)
+            card.resize(width, height)
+            card.selected.connect(self._set_selected_visual_button)
+            card.edit_requested.connect(self._select_visual_button)
+            card.context_requested.connect(self._show_button_context_menu)
+            self._visible_cards[button_id] = card
+            return card
+
+        def _make_slot_label(label: str, *, width: int, height: int, muted: bool = False) -> QLabel:
+            lbl = QLabel(label)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setFixedSize(width, height)
+            border = "#cbd5e1" if not muted else "#e2e8f0"
+            fg = "#94a3b8" if not muted else "#cbd5e1"
+            bg = "#f8fafc" if not muted else "#f1f5f9"
+            lbl.setStyleSheet(
+                f"QLabel {{ border: 1px dashed {border}; border-radius: 8px; "
+                f"color: {fg}; font-size: 11px; background: {bg}; }}"
+            )
+            return lbl
+
+        for n in range(3):
+            if n in enc_by_index:
+                bid, btn = enc_by_index[n]
+                self._ld_enc_left_layout.addWidget(_make_card(bid, btn, width=side_w, height=side_h))
+            else:
+                self._ld_enc_left_layout.addWidget(_make_slot_label(f"e{n}", width=side_w, height=side_h))
+
+        for row in range(3):
+            self._ld_center_layout.setRowMinimumHeight(row, tile_px)
+            for col in range(4):
+                self._ld_center_layout.setColumnMinimumWidth(col, tile_px)
+                self._ld_center_layout.addWidget(_make_slot_label("", width=tile_px, height=tile_px, muted=True), row, col)
+
+        for n in range(3, 6):
+            if n in enc_by_index:
+                bid, btn = enc_by_index[n]
+                self._ld_enc_right_layout.addWidget(_make_card(bid, btn, width=side_w, height=side_h))
+            else:
+                self._ld_enc_right_layout.addWidget(_make_slot_label(f"e{n}", width=side_w, height=side_h))
+
+        phys_labels = ["●", "1", "2", "3", "4", "5", "6", "7"]
+        for n in range(8):
+            lbl = _make_slot_label(phys_labels[n], width=phys_px, height=phys_px, muted=True)
+            self._ld_phys_layout.insertWidget(self._ld_phys_layout.count() - 1, lbl)
 
     def _position_span_cards(self) -> None:
         """DEPRECATED: Now handled by native QGridLayout spanning in _rebuild_visual_widgets."""
@@ -3712,7 +4394,7 @@ class EditorTab(QWidget):
             delete_action = menu.addAction(f"Delete {count} Buttons")
         else:
             copy_action = menu.addAction("Copy Button")
-            edit_action = menu.addAction("Edit Button")
+            edit_action = menu.addAction("Open in Designer")
             paste_action = menu.addAction("Paste Over Button")
             paste_action.setEnabled(self._clipboard_button_data() is not None)
             delete_action = menu.addAction("Delete Button")
@@ -3721,7 +4403,7 @@ class EditorTab(QWidget):
             self._copy_selection_to_clipboard()
             return
         if edit_action and chosen is edit_action:
-            self._select_visual_button(button_id)
+            self._send_to_designer(button_id=button_id)
             return
         if paste_action and chosen is paste_action:
             index = self._button_index(self._visual_buttons[button_id])
@@ -3910,6 +4592,28 @@ class EditorTab(QWidget):
         self._update_action_state()
         return True
 
+    def _send_to_designer(self, button_id: str | None = None) -> None:
+        bid = button_id or self._button_edit_id
+        if bid and bid in self._visual_buttons:
+            button_yaml = yaml.safe_dump(self._visual_buttons[bid], sort_keys=False, allow_unicode=False)
+        else:
+            button_yaml = self._button_doc.to_yaml().strip()
+        if not button_yaml:
+            return
+        deck_name = str(self._visual_deck_name or "").strip()
+        root_path = str(self._current_target_path or "").strip()
+        file_path = str(self._current_file_path or "").strip()
+        self.open_in_designer.emit(button_yaml, deck_name, root_path, bid or "", file_path)
+
+    def save_button_from_designer(self, button_yaml: str, button_id: str) -> None:
+        """Called by MainWindow when the designer saves a button back to this file."""
+        if not button_id or not self._current_file_path:
+            return
+        ok = self._apply_button_yaml(button_id, button_yaml, silent=False)
+        if ok:
+            self.save_current_file()
+            self.log_line.emit(f"[designer] saved {button_id} to {self._current_file_path.name}")
+
     def _open_button_editor_workspace(self, button_id: str, *, initial_text: str | None = None, on_apply=None) -> None:
         self._button_edit_id = button_id
         self._button_edit_on_apply = on_apply
@@ -4014,10 +4718,7 @@ class EditorTab(QWidget):
         self._sync_text_from_visual()
         self._rebuild_visual_widgets()
         self._refresh_selected_button_panel()
-        self._open_button_editor_workspace(
-            button_id,
-            initial_text=yaml.safe_dump(new_button, sort_keys=False, allow_unicode=False),
-        )
+        self._send_to_designer(button_id=button_id)
 
     def _delete_button(self, button_id: str) -> None:
         if button_id not in self._visual_buttons:
@@ -4087,7 +4788,6 @@ class EditorTab(QWidget):
             self._loading_file = False
         if mark_modified:
             self.modified_label.setText("Unsaved changes")
-            self._page_autosave_timer.start(1000)
         else:
             self.modified_label.setText("")
         self._effective_page_attrs_cache = {}
@@ -4098,11 +4798,12 @@ class EditorTab(QWidget):
         current = self.stack.currentWidget()
         visual_active = current is self.visual_scroll
         config_visual_active = current is self.config_form_scroll
-        button_edit_active = current is self.button_edit_page
         self.btn_refresh.setEnabled(has_target)
         self.btn_reveal_target.setEnabled(has_target)
         self.btn_reveal_file.setEnabled(has_file)
-        self._view_zoom_bar.setVisible(not button_edit_active)
+        has_unsaved = has_file and self.editor.document().isModified()
+        self.btn_save.setEnabled(has_unsaved)
+        self._view_zoom_bar.setVisible(True)
         self.btn_visual_view.setEnabled(self._visual_enabled)
         self.btn_zoom_out.setEnabled(self._visual_enabled and visual_active)
         self.btn_zoom_fit.setEnabled(self._visual_enabled and visual_active)
@@ -4128,7 +4829,9 @@ class EditorTab(QWidget):
         self._preview_queue = [item for item in self._preview_queue if item[0] != key]
 
     def _ensure_button_preview(self, button_id: str) -> None:
-        if button_id not in self._visual_buttons or not self._visual_deck_name:
+        if button_id not in self._visual_buttons and button_id not in self._included_buttons:
+            return
+        if not self._visual_deck_name:
             return
         key = self._preview_key(button_id)
         if key in self._preview_cache or key in self._preview_errors or key in self._preview_inflight or key in self._preview_queue_keys:
@@ -4189,7 +4892,7 @@ class EditorTab(QWidget):
     def _refresh_preview_results(self) -> None:
         if self._visual_enabled and self.stack.currentWidget() is self.visual_scroll:
             for button_id, card in list(self._visible_cards.items()):
-                if button_id not in self._visual_buttons:
+                if button_id not in self._visual_buttons and button_id not in self._included_buttons:
                     continue
                 key = self._preview_key(button_id)
                 card.update_preview(

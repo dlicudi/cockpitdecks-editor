@@ -1,2 +1,3 @@
 # cockpitdecks-editor
-Cockpitdecks layout editor
+
+Dedicated Cockpitdecks configuration editor extracted from the Desktop app.

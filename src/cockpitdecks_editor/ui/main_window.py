@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QFrame,
@@ -17,6 +15,8 @@ from PySide6.QtWidgets import (
 from cockpitdecks_editor.services.desktop_settings import load as load_settings
 from cockpitdecks_editor.services.targets import shorten_filesystem_path
 from cockpitdecks_editor.ui.app_style import MAIN_WINDOW_QSS
+from cockpitdecks_editor.ui.dataref_tab import DatarefTab
+from cockpitdecks_editor.ui.designer_tab import DesignerTab
 from cockpitdecks_editor.ui.editor_tab import EditorTab
 
 
@@ -53,17 +53,18 @@ class MainWindow(QMainWindow):
         self.editor_tab = EditorTab()
         self.editor_tab.log_line.connect(self._append_status)
         self.editor_tab.root_path_changed.connect(self._sync_root_summary)
+        self.editor_tab.root_path_changed.connect(self._on_root_changed)
+        self.editor_tab.open_in_designer.connect(self._open_button_in_designer)
         self.tabs.addTab(self.editor_tab, "Editor")
 
-        placeholder = QWidget()
-        pl = QVBoxLayout(placeholder)
-        pl.setContentsMargins(16, 16, 16, 16)
-        hint = QLabel("Future home for config-oriented tools such as validation, search/replace, templates, and page operations.")
-        hint.setWordWrap(True)
-        hint.setStyleSheet("font-size: 13px; color: #475569;")
-        pl.addWidget(hint)
-        pl.addStretch(1)
-        self.tabs.addTab(placeholder, "Tools")
+        self.designer_tab = DesignerTab()
+        self.designer_tab.log_line.connect(self._append_status)
+        self.designer_tab.save_to_page.connect(self._save_button_to_page)
+        self.tabs.addTab(self.designer_tab, "Button Designer")
+
+        self.dataref_tab = DatarefTab()
+        self.dataref_tab.log_line.connect(self._append_status)
+        self.tabs.addTab(self.dataref_tab, "Dataref Navigator")
 
         root.addWidget(self.tabs, 1)
 
@@ -82,6 +83,23 @@ class MainWindow(QMainWindow):
             self.editor_tab.open_root_path(selected)
         else:
             self._sync_root_summary("")
+
+    def _on_root_changed(self, path: str) -> None:
+        self.designer_tab.set_target(path if path else None)
+
+    def _open_button_in_designer(self, button_yaml: str, deck_name: str, root_path: str, button_id: str, file_path: str) -> None:
+        self.designer_tab.load_button(
+            button_yaml,
+            deck_name=deck_name,
+            root_path=root_path or None,
+            button_id=button_id,
+            file_path=file_path,
+        )
+        self.tabs.setCurrentWidget(self.designer_tab)
+
+    def _save_button_to_page(self, button_yaml: str, button_id: str, file_path: str) -> None:
+        self.editor_tab.save_button_from_designer(button_yaml, button_id)
+        self.tabs.setCurrentWidget(self.editor_tab)
 
     def _sync_root_summary(self, path: str) -> None:
         if path:
