@@ -36,124 +36,6 @@ from cockpitdecks_editor.ui.editor_tab import _render_preview_with_fallback
 from cockpitdecks_editor.ui.syntax import KeyValueHighlighter, YamlHighlighter
 
 
-_STARTER_TEMPLATES: list[dict] = [
-    {
-        "label": "Momentary",
-        "config": {
-            "index": 0,
-            "activation": {
-                "type": "push",
-                "commands": {"press": "sim/none/command"},
-            },
-            "representation": {
-                "type": "icon-color",
-                "label": "BUTTON",
-                "label-size": 14,
-            },
-        },
-    },
-    {
-        "label": "Push + Annunciator",
-        "config": {
-            "index": 0,
-            "activation": {
-                "type": "push",
-                "commands": {"press": "sim/none/command"},
-            },
-            "representation": {
-                "type": "annunciator",
-                "label": "BUTTON",
-                "annunciator": {
-                    "model": "B",
-                    "size": "medium",
-                    "parts": [
-                        {"color": "lime", "led": "bars", "formula": "0"},
-                        {"text": "LABEL", "text-size": 44, "formula": "1"},
-                    ],
-                },
-            },
-        },
-    },
-    {
-        "label": "Toggle On/Off",
-        "config": {
-            "index": 0,
-            "activation": {
-                "type": "encoder-toggle",
-                "commands": {
-                    "toggle-on": "sim/none/on",
-                    "toggle-off": "sim/none/off",
-                },
-            },
-            "representation": {
-                "type": "annunciator",
-                "label": "BUTTON",
-                "annunciator": {
-                    "model": "B",
-                    "size": "medium",
-                    "parts": [
-                        {"color": "lime", "led": "bars", "formula": "0"},
-                        {"text": "LABEL", "text-size": 44, "formula": "1"},
-                    ],
-                },
-            },
-        },
-    },
-    {
-        "label": "Page Nav",
-        "config": {
-            "index": 0,
-            "activation": {
-                "type": "page",
-                "page": "index",
-            },
-            "representation": {
-                "type": "icon-color",
-                "label": "PAGE",
-                "label-size": 14,
-            },
-        },
-    },
-    {
-        "label": "Status Tile",
-        "config": {
-            "index": 0,
-            "activation": {
-                "type": "none",
-            },
-            "representation": {
-                "type": "text",
-                "label": "STATUS",
-                "label-size": 12,
-                "text": "${sim/...}",
-                "text-size": 24,
-            },
-        },
-    },
-    {
-        "label": "Gauge",
-        "config": {
-            "index": 0,
-            "activation": {
-                "type": "none",
-            },
-            "representation": {
-                "type": "gauge",
-                "label": "GAUGE",
-                "label-size": 12,
-                "formula": "${sim/...}",
-                "gauge": {
-                    "tick-from": -120,
-                    "tick-to": 120,
-                    "ticks": 9,
-                    "needle-color": "white",
-                },
-            },
-        },
-    },
-]
-
-
 _DATAREF_TOKEN_RE = re.compile(r"\$\{([^}]+)\}")
 _DATAREF_KEYS = {"dataref", "set-dataref"}
 
@@ -362,27 +244,6 @@ class DesignerTab(QWidget):
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(10)
 
-        # ── Preset toolbar ────────────────────────────────────────────────────
-        preset_bar = QFrame()
-        preset_bar.setObjectName("actionBar")
-        preset_bar_layout = QHBoxLayout(preset_bar)
-        preset_bar_layout.setContentsMargins(10, 8, 10, 8)
-        preset_bar_layout.setSpacing(8)
-        lbl = QLabel("Start from:")
-        lbl.setStyleSheet("font-size: 11px; font-weight: 700; color: #334155;")
-        preset_bar_layout.addWidget(lbl)
-        for tmpl in _STARTER_TEMPLATES:
-            btn = QPushButton(tmpl["label"])
-            btn.setFixedHeight(28)
-            btn.clicked.connect(lambda _=False, t=tmpl: self._load_template(t))
-            preset_bar_layout.addWidget(btn)
-        preset_bar_layout.addStretch(1)
-        btn_clear = QPushButton("Clear")
-        btn_clear.setFixedHeight(28)
-        btn_clear.clicked.connect(self._clear)
-        preset_bar_layout.addWidget(btn_clear)
-        root.addWidget(preset_bar)
-
         # ── Three-pane splitter ───────────────────────────────────────────────
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
@@ -516,6 +377,10 @@ class DesignerTab(QWidget):
         self.btn_copy.setFixedHeight(32)
         self.btn_copy.clicked.connect(self._copy_yaml)
         bottom.addWidget(self.btn_copy)
+        btn_clear = QPushButton("Clear")
+        btn_clear.setFixedHeight(32)
+        btn_clear.clicked.connect(self._clear)
+        bottom.addWidget(btn_clear)
         bottom.addStretch(1)
         self.btn_save_to_page = QPushButton("Save and Close")
         self.btn_save_to_page.setFixedHeight(32)
@@ -607,26 +472,6 @@ class DesignerTab(QWidget):
         self.btn_save_to_page.setEnabled(False)
 
     # ── Internal ──────────────────────────────────────────────────────────────
-
-    def _load_template(self, tmpl: dict) -> None:
-        data = dict(tmpl["config"])
-        # Loading a preset breaks the editor ↔ designer link
-        self._source_button_id = ""
-        self._source_file_path = ""
-        self._loaded_yaml_str = ""
-        self.btn_save_to_page.setEnabled(False)
-        self.btn_save_to_page.setToolTip("No source page — use Copy YAML instead")
-        self.button_form.clear_stash()
-        self._loading = True
-        try:
-            self.yaml_edit.setPlainText(
-                yaml.safe_dump(data, sort_keys=False, allow_unicode=False)
-            )
-            self.button_form.load(data)
-        finally:
-            self._loading = False
-        self._autofill_fake_datarefs(data)
-        self._schedule_preview()
 
     def _clear(self) -> None:
         self._source_button_id = ""

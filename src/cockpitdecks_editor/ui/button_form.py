@@ -69,38 +69,24 @@ def _set_combo(combo: QComboBox, value: str) -> None:
     combo.setCurrentIndex(0)
 
 
-class CollapsibleSection(QWidget):
-    """A widget that provides a collapsible header and a content area."""
-
-    def __init__(self, title: str, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        vbox = QVBoxLayout(self)
-        vbox.setContentsMargins(0, 0, 0, 0)
-        vbox.setSpacing(0)
-
-        self.header = QPushButton(title)
-        self.header.setCheckable(True)
-        self.header.setChecked(True)
-        self.header.setCursor(Qt.PointingHandCursor)
-        self.header.setStyleSheet(
-            "QPushButton { text-align: left; font-weight: bold; padding: 10px; "
-            "background: #f1f5f9; color: #334155; border: 1px solid #e2e8f0; "
-            "border-left: 4px solid #6366f1; border-radius: 4px; font-size: 13px; }"
-            "QPushButton:hover { background: #e2e8f0; }"
-            "QPushButton:checked { border-bottom-left-radius: 0; border-bottom-right-radius: 0; }"
-        )
-        vbox.addWidget(self.header)
-
-        self.content_wrapper = QFrame()
-        self.content_wrapper.setStyleSheet(
-            "QFrame { background: #f8fafc; border: 1px solid #e2e8f0; "
-            "border-top: none; border-bottom-left-radius: 4px; border-bottom-right-radius: 4px; }"
-        )
-        self.content_layout = QFormLayout(self.content_wrapper)
-        self.content_layout.setContentsMargins(12, 12, 12, 12)
-        vbox.addWidget(self.content_wrapper)
-
-        self.header.toggled.connect(self.content_wrapper.setVisible)
+# Priority order for representation parameter group headers.
+# Groups not listed here fall back to a high sort key (appear last).
+_GROUP_ORDER: dict[str, int] = {
+    "Style": 0,
+    "Identification": 1,
+    "Display": 2,
+    "Visuals": 3,
+    "Positions": 4,
+    "Appearance": 5,
+    "Ticks": 6,
+    "Labels": 7,
+    "Needle": 8,
+    "Colors": 9,
+    "Logic": 10,
+    "Execution": 11,
+    "Effects": 12,
+    "Parameters": 98,
+}
 
 
 def _activation_family_for_type(activation_type: str) -> str:
@@ -367,14 +353,13 @@ class ButtonFormWidget(QWidget):
         rep_sub_lbl.setFont(bold_font)
         self._rep_form.addRow(rep_sub_lbl, self._wrap_with_hint(self.style_combo, {"hint": "Specific visual style for this representation family"}))
 
-        # Container for categorized parameter groups
+        # Container for dynamic representation parameter fields
         self._dynamic_rep_container = QWidget()
         self._dynamic_rep_vbox = QVBoxLayout(self._dynamic_rep_container)
         self._dynamic_rep_vbox.setContentsMargins(0, 8, 0, 0)
-        self._dynamic_rep_vbox.setSpacing(12)
+        self._dynamic_rep_vbox.setSpacing(0)
         self._rep_form.addRow(self._dynamic_rep_container)
         self._dynamic_rep_row = self._dynamic_rep_container
-        self._dynamic_sections: dict[str, CollapsibleSection] = {}
         self._dynamic_rep_widgets: dict[str, QWidget] = {}
 
         rep_layout.addLayout(self._rep_form)
@@ -544,7 +529,6 @@ class ButtonFormWidget(QWidget):
             item = self._dynamic_rep_vbox.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
-        self._dynamic_sections.clear()
         self._dynamic_rep_widgets = {}
 
     def _rebuild_dynamic_rep_form(self, style: str, data: dict) -> None:
@@ -553,11 +537,11 @@ class ButtonFormWidget(QWidget):
         schema = _REPRESENTATION_SCHEMAS.get(rep_name)
         if not schema:
             return
-            
+
         values = self._representation_values_from_data(rep_name, data)
         self._dynamic_rep_widgets = {}
-        
-        # Group fields
+
+        # Collect and sort fields by group priority
         fields_by_group: dict[str, list[tuple[str, dict]]] = {}
         for field_name, field in (schema.get("editor_fields") or {}).items():
             if field_name == "type":
@@ -565,32 +549,46 @@ class ButtonFormWidget(QWidget):
             group = str(field.get("group") or "Parameters")
             fields_by_group.setdefault(group, []).append((field_name, field))
 
-        # Create sections
-        for group, fields in fields_by_group.items():
-            section = CollapsibleSection(group)
-            self._dynamic_rep_vbox.addWidget(section)
-            self._dynamic_sections[group] = section
-            
-            for field_name, field in fields:
+        if not fields_by_group:
+            return
+
+        sorted_groups = sorted(
+            fields_by_group.keys(),
+            key=lambda g: (_GROUP_ORDER.get(g, 99), g),
+        )
+
+        # Single flat QFormLayout matching the Activation / Representation style above,
+        # with lightweight uppercase separator labels between groups.
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(6)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        container = QWidget()
+        container.setLayout(form)
+        self._dynamic_rep_vbox.addWidget(container)
+
+        for i, group in enumerate(sorted_groups):
+            sep = QLabel(group.upper())
+            sep.setStyleSheet(
+                ("margin-top: 10px; " if i > 0 else "") +
+                "font-size: 10px; letter-spacing: 0.08em; font-weight: 700; "
+                "color: #94a3b8; padding-bottom: 2px; border-bottom: 1px solid #e2e8f0;"
+            )
+            form.addRow(sep)
+
+            for field_name, field in fields_by_group[group]:
                 widget = self._create_dynamic_rep_widget(field, values.get(field_name))
                 self._dynamic_rep_widgets[field_name] = widget
-                
+
                 wrapped = self._wrap_with_hint(widget, field)
                 label_text = str(field.get("label") or field_name)
-                
                 label = QLabel(label_text)
                 if field.get("required"):
                     font = label.font()
                     font.setBold(True)
                     label.setFont(font)
-                
-                section.content_layout.addRow(label, wrapped)
-
-        self._update_group_visibilities()
-
-    def _update_group_visibilities(self) -> None:
-        for group, section in self._dynamic_sections.items():
-            section.setVisible(section.content_layout.rowCount() > 0)
+                form.addRow(label, wrapped)
 
     def _on_gallery_template_selected(self, data: dict) -> None:
         self.load(data)
