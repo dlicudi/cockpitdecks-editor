@@ -150,6 +150,165 @@ _REPRESENTATION_ROOT_FIELDS = {
     "vibrate",
 }
 
+# ── Annunciator parts widget ─────────────────────────────────────────────────
+
+_ANN_LED_CHOICES = [
+    ("", "None (text only)"),
+    ("bar", "bar"), ("bars", "bars"), ("block", "block"),
+    ("dot", "dot"), ("lgear", "lgear"), ("led", "led"),
+]
+
+
+class AnnunciatorPartsWidget(QWidget):
+    """Structured editor for a list of annunciator parts (one group per part)."""
+
+    changed = Signal()
+
+    def __init__(self, model: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._loading = False
+        self._rows: list[dict] = []
+        part_ids = _ANNUNCIATOR_PART_IDS.get(model, [f"{model}0"])
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(6)
+
+        for idx, part_id in enumerate(part_ids):
+            frame = QFrame()
+            frame.setFrameShape(QFrame.Shape.StyledPanel)
+            frame.setStyleSheet("QFrame { border: 1px solid #e2e8f0; border-radius: 4px; }")
+            fl = QFormLayout(frame)
+            fl.setContentsMargins(8, 6, 8, 6)
+            fl.setSpacing(4)
+            fl.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+            header = QLabel(f"Part {part_id}")
+            header.setStyleSheet("font-size: 10px; font-weight: 700; color: #64748b; border: none;")
+            fl.addRow(header)
+
+            text_edit = QLineEdit()
+            text_edit.setPlaceholderText("${formula}")
+            fl.addRow("Text", text_edit)
+
+            formula_edit = QLineEdit()
+            formula_edit.setPlaceholderText("${sim/...} ...")
+            fl.addRow("Formula", formula_edit)
+
+            fmt_edit = QLineEdit()
+            fmt_edit.setPlaceholderText("{0:.0f}")
+            fl.addRow("Format", fmt_edit)
+
+            font_combo = _NoWheelComboBox()
+            font_combo.setEditable(True)
+            font_combo.addItem("(default)", "")
+            font_combo.lineEdit().setPlaceholderText("font name")
+
+            size_spin = _NoWheelSpinBox()
+            size_spin.setRange(0, 256)
+            size_spin.setSpecialValueText("Default")
+            size_spin.setFixedWidth(70)
+
+            font_size_row = QWidget()
+            font_size_row.setStyleSheet("border: none;")
+            fsl = QHBoxLayout(font_size_row)
+            fsl.setContentsMargins(0, 0, 0, 0)
+            fsl.setSpacing(4)
+            fsl.addWidget(font_combo, 1)
+            fsl.addWidget(QLabel("Size"))
+            fsl.addWidget(size_spin)
+            fl.addRow("Font", font_size_row)
+
+            color_edit = QLineEdit()
+            color_edit.setPlaceholderText("lime, orange, #ff0000…")
+            fl.addRow("Color", color_edit)
+
+            led_combo = _NoWheelComboBox()
+            for val, label in _ANN_LED_CHOICES:
+                led_combo.addItem(label, val)
+            fl.addRow("LED", led_combo)
+
+            outer.addWidget(frame)
+            row = {
+                "text_edit": text_edit,
+                "formula_edit": formula_edit,
+                "fmt_edit": fmt_edit,
+                "font_combo": font_combo,
+                "size_spin": size_spin,
+                "color_edit": color_edit,
+                "led_combo": led_combo,
+            }
+            self._rows.append(row)
+
+            for w in (text_edit, formula_edit, fmt_edit, color_edit):
+                w.textChanged.connect(self._emit)
+            font_combo.currentTextChanged.connect(self._emit)
+            size_spin.valueChanged.connect(self._emit)
+            led_combo.currentIndexChanged.connect(self._emit)
+
+    def _emit(self) -> None:
+        if not self._loading:
+            self.changed.emit()
+
+    def populate_fonts(self, font_names: list[str]) -> None:
+        for row in self._rows:
+            combo = row["font_combo"]
+            current = combo.currentText().strip()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("(default)", "")
+            for name in font_names:
+                combo.addItem(name, name)
+            _set_combo(combo, current)
+            combo.blockSignals(False)
+
+    def load(self, parts_list: list) -> None:
+        self._loading = True
+        try:
+            for idx, row in enumerate(self._rows):
+                part = parts_list[idx] if idx < len(parts_list) else {}
+                if not isinstance(part, dict):
+                    part = {}
+                row["text_edit"].setText(str(part.get("text") or ""))
+                row["formula_edit"].setText(str(part.get("formula") or ""))
+                row["fmt_edit"].setText(str(part.get("text-format") or ""))
+                _set_combo(row["font_combo"], str(part.get("text-font") or ""))
+                row["size_spin"].setValue(int(part.get("text-size") or 0))
+                row["color_edit"].setText(str(part.get("color") or ""))
+                _set_combo(row["led_combo"], str(part.get("led") or ""))
+        finally:
+            self._loading = False
+
+    def collect(self) -> list | None:
+        result = []
+        for row in self._rows:
+            part: dict = {}
+            text = row["text_edit"].text().strip()
+            formula = row["formula_edit"].text().strip()
+            fmt = row["fmt_edit"].text().strip()
+            font = row["font_combo"].currentText().strip()
+            size = row["size_spin"].value()
+            color = row["color_edit"].text().strip()
+            led = str(row["led_combo"].currentData() or "").strip()
+            if text:
+                part["text"] = text
+            if formula:
+                part["formula"] = formula
+            if fmt:
+                part["text-format"] = fmt
+            if font and font not in ("", "(default)"):
+                part["text-font"] = font
+            if size > 0:
+                part["text-size"] = size
+            if color:
+                part["color"] = color
+            if led:
+                part["led"] = led
+            if part:
+                result.append(part)
+        return result or None
+
+
 # ── Widget ────────────────────────────────────────────────────────────────────
 
 class ButtonFormWidget(QWidget):
@@ -578,6 +737,20 @@ class ButtonFormWidget(QWidget):
             form.addRow(sep)
 
             for field_name, field in fields_by_group[group]:
+                # Annunciator parts get a structured multi-row widget, not a raw text area.
+                if rep_name == "annunciator" and field_name == "parts":
+                    rep_cfg = data.get("representation") if isinstance(data.get("representation"), dict) else {}
+                    ann_cfg = rep_cfg.get("annunciator") if isinstance(rep_cfg.get("annunciator"), dict) else {}
+                    model = str(ann_cfg.get("model") or "A")
+                    widget = AnnunciatorPartsWidget(model)
+                    parts_val = values.get("parts")
+                    if isinstance(parts_val, list):
+                        widget.load(parts_val)
+                    widget.changed.connect(self._on_form_changed)
+                    self._dynamic_rep_widgets["parts"] = widget
+                    form.addRow(widget)
+                    continue
+
                 widget = self._create_dynamic_rep_widget(field, values.get(field_name))
                 self._dynamic_rep_widgets[field_name] = widget
 
@@ -597,6 +770,8 @@ class ButtonFormWidget(QWidget):
         widget = self._dynamic_rep_widgets.get(field_name)
         if widget is None:
             return None
+        if isinstance(widget, AnnunciatorPartsWidget):
+            return widget.collect()
         field_type = str(field.get("type") or "string")
         if field_type == "boolean":
             return widget.isChecked() or None
@@ -697,7 +872,9 @@ class ButtonFormWidget(QWidget):
 
     def populate_fonts(self, font_names: list[str]) -> None:
         """Reload font combos with available font names (call after target is set)."""
-        pass
+        parts_widget = self._dynamic_rep_widgets.get("parts")
+        if isinstance(parts_widget, AnnunciatorPartsWidget):
+            parts_widget.populate_fonts(font_names)
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
@@ -860,7 +1037,16 @@ class ButtonFormWidget(QWidget):
             key: value for key, value in current_representation.items() if key not in managed_root_keys
         }
         representation_obj["type"] = rep_type
-        
+
+        # For nested_block representations, seed the nested sub-dict with existing data so that
+        # unmanaged keys (e.g. "size", "model" inside "annunciator") are not silently dropped.
+        if rep_type in _REPRESENTATION_NESTED_BLOCKS:
+            existing_nested = current_representation.get(rep_type)
+            if isinstance(existing_nested, dict):
+                representation_obj.setdefault(rep_type, {}).update(
+                    {k: v for k, v in existing_nested.items()}
+                )
+
         for field_name, field in (schema.get("editor_fields") or {}).items():
             if field_name == "type":
                 continue

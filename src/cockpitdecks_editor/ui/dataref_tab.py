@@ -39,8 +39,12 @@ from cockpitdecks_editor.services.xplane_refs import (
     DatarefRecord,
     default_commands_path,
     default_datarefs_path,
+    default_drt_commands_path,
+    default_drt_datarefs_path,
     parse_commands,
     parse_datarefs,
+    parse_drt_commands,
+    parse_drt_datarefs,
 )
 
 
@@ -63,7 +67,7 @@ _KIND_COMMAND = "Command"
 # ── Table model ───────────────────────────────────────────────────────────────
 
 class _Row:
-    __slots__ = ("kind", "name", "dtype", "writable", "units", "description", "is_array")
+    __slots__ = ("kind", "name", "dtype", "writable", "units", "description", "is_array", "source")
 
     def __init__(
         self,
@@ -74,6 +78,7 @@ class _Row:
         units: str = "",
         description: str = "",
         is_array: bool = False,
+        source: str = "xplane",   # "xplane" or "plugin"
     ) -> None:
         self.kind = kind
         self.name = name
@@ -82,6 +87,7 @@ class _Row:
         self.units = units
         self.description = description
         self.is_array = is_array
+        self.source = source
 
 
 class _RefsModel(QAbstractTableModel):
@@ -124,6 +130,10 @@ class _RefsModel(QAbstractTableModel):
 
         if role == Qt.ItemDataRole.ForegroundRole:
             if col == _COL_KIND:
+                if row.source == "plugin":
+                    if row.kind == _KIND_COMMAND:
+                        return QColor("#9333ea")   # muted purple for plugin commands
+                    return QColor("#b45309")       # amber for plugin datarefs
                 if row.kind == _KIND_COMMAND:
                     return QColor("#7c3aed")   # purple for commands
                 if row.is_array:
@@ -291,6 +301,9 @@ class DatarefTab(QWidget):
 
     def _auto_load(self) -> None:
         rows: list[_Row] = []
+
+        # ── X-Plane built-in datarefs (with full metadata) ────────────────────
+        known_datarefs: set[str] = set()
         dr_path = default_datarefs_path()
         if dr_path:
             for rec in parse_datarefs(dr_path):
@@ -302,19 +315,45 @@ class DatarefTab(QWidget):
                     units=rec.units,
                     description=rec.description,
                     is_array=rec.is_array,
+                    source="xplane",
                 ))
+                known_datarefs.add(rec.name)
+
+        # ── Plugin/aircraft datarefs from DataRefTool last-run file ───────────
+        drt_dr_path = default_drt_datarefs_path()
+        if drt_dr_path:
+            for name in parse_drt_datarefs(drt_dr_path):
+                if name not in known_datarefs:
+                    rows.append(_Row(
+                        kind=_KIND_DATAREF,
+                        name=name,
+                        source="plugin",
+                    ))
+
+        # ── X-Plane built-in commands ─────────────────────────────────────────
+        known_commands: set[str] = set()
         cmd_path = default_commands_path()
         if cmd_path:
             for rec in parse_commands(cmd_path):
                 rows.append(_Row(
                     kind=_KIND_COMMAND,
                     name=rec.name,
-                    dtype="",
-                    writable=False,
-                    units="",
                     description=rec.description,
-                    is_array=False,
+                    source="xplane",
                 ))
+                known_commands.add(rec.name)
+
+        # ── Plugin/aircraft commands from DataRefTool last-run file ───────────
+        drt_cmd_path = default_drt_commands_path()
+        if drt_cmd_path:
+            for name in parse_drt_commands(drt_cmd_path):
+                if name not in known_commands:
+                    rows.append(_Row(
+                        kind=_KIND_COMMAND,
+                        name=name,
+                        source="plugin",
+                    ))
+
         self._load_done.emit(rows)
 
     def _browse_and_load(self) -> None:
@@ -332,45 +371,66 @@ class DatarefTab(QWidget):
         def _worker(fp=p):
             rows: list[_Row] = []
             name_lower = fp.name.lower()
+            is_drt = "drt_last_run" in name_lower or "last_run" in name_lower
+
             if "dataref" in name_lower:
-                for rec in parse_datarefs(fp):
-                    rows.append(_Row(
-                        kind=_KIND_DATAREF,
-                        name=rec.name,
-                        dtype=rec.dtype,
-                        writable=rec.writable,
-                        units=rec.units,
-                        description=rec.description,
-                        is_array=rec.is_array,
-                    ))
-                # Merge with existing commands
-                existing_commands = [r for r in self._all_rows if r.kind == _KIND_COMMAND]
-                rows = rows + existing_commands
+                if is_drt:
+                    # Name-only format from DataRefTool
+                    known = {r.name for r in self._all_rows if r.kind == _KIND_DATAREF and r.source == "xplane"}
+                    new_rows = [
+                        _Row(kind=_KIND_DATAREF, name=n, source="plugin")
+                        for n in parse_drt_datarefs(fp) if n not in known
+                    ]
+                    existing_xplane = [r for r in self._all_rows if r.kind == _KIND_DATAREF and r.source == "xplane"]
+                    existing_cmds = [r for r in self._all_rows if r.kind == _KIND_COMMAND]
+                    rows = existing_xplane + new_rows + existing_cmds
+                else:
+                    for rec in parse_datarefs(fp):
+                        rows.append(_Row(
+                            kind=_KIND_DATAREF,
+                            name=rec.name,
+                            dtype=rec.dtype,
+                            writable=rec.writable,
+                            units=rec.units,
+                            description=rec.description,
+                            is_array=rec.is_array,
+                            source="xplane",
+                        ))
+                    # Merge with existing commands
+                    existing_commands = [r for r in self._all_rows if r.kind == _KIND_COMMAND]
+                    rows = rows + existing_commands
             elif "command" in name_lower:
-                for rec in parse_commands(fp):
-                    rows.append(_Row(
-                        kind=_KIND_COMMAND,
-                        name=rec.name,
-                        dtype="",
-                        writable=False,
-                        units="",
-                        description=rec.description,
-                        is_array=False,
-                    ))
-                # Merge with existing datarefs
-                existing_datarefs = [r for r in self._all_rows if r.kind == _KIND_DATAREF]
-                rows = existing_datarefs + rows
+                if is_drt:
+                    known = {r.name for r in self._all_rows if r.kind == _KIND_COMMAND and r.source == "xplane"}
+                    new_rows = [
+                        _Row(kind=_KIND_COMMAND, name=n, source="plugin")
+                        for n in parse_drt_commands(fp) if n not in known
+                    ]
+                    existing_drs = [r for r in self._all_rows if r.kind == _KIND_DATAREF]
+                    existing_xplane_cmds = [r for r in self._all_rows if r.kind == _KIND_COMMAND and r.source == "xplane"]
+                    rows = existing_drs + existing_xplane_cmds + new_rows
+                else:
+                    for rec in parse_commands(fp):
+                        rows.append(_Row(
+                            kind=_KIND_COMMAND,
+                            name=rec.name,
+                            description=rec.description,
+                            source="xplane",
+                        ))
+                    # Merge with existing datarefs
+                    existing_datarefs = [r for r in self._all_rows if r.kind == _KIND_DATAREF]
+                    rows = existing_datarefs + rows
             else:
                 # Unknown — try both parsers
                 rows = [
                     _Row(kind=_KIND_DATAREF, name=rec.name, dtype=rec.dtype,
                          writable=rec.writable, units=rec.units,
-                         description=rec.description, is_array=rec.is_array)
+                         description=rec.description, is_array=rec.is_array,
+                         source="xplane")
                     for rec in parse_datarefs(fp)
                 ] or [
-                    _Row(kind=_KIND_COMMAND, name=rec.name, dtype="",
-                         writable=False, units="", description=rec.description,
-                         is_array=False)
+                    _Row(kind=_KIND_COMMAND, name=rec.name,
+                         description=rec.description, source="xplane")
                     for rec in parse_commands(fp)
                 ]
             self._load_done.emit(rows)
@@ -393,13 +453,25 @@ class DatarefTab(QWidget):
         hdr.resizeSection(_COL_WRITE, 70)
         hdr.resizeSection(_COL_UNITS, 80)
 
-        n_dr = sum(1 for r in rows if r.kind == _KIND_DATAREF)
-        n_cmd = sum(1 for r in rows if r.kind == _KIND_COMMAND)
+        n_dr = sum(1 for r in rows if r.kind == _KIND_DATAREF and r.source == "xplane")
+        n_dr_plugin = sum(1 for r in rows if r.kind == _KIND_DATAREF and r.source == "plugin")
+        n_cmd = sum(1 for r in rows if r.kind == _KIND_COMMAND and r.source == "xplane")
+        n_cmd_plugin = sum(1 for r in rows if r.kind == _KIND_COMMAND and r.source == "plugin")
         parts = []
         if n_dr:
-            parts.append(f"{n_dr:,} datarefs")
+            dr_str = f"{n_dr:,} datarefs"
+            if n_dr_plugin:
+                dr_str += f" + {n_dr_plugin:,} plugin"
+            parts.append(dr_str)
+        elif n_dr_plugin:
+            parts.append(f"{n_dr_plugin:,} plugin datarefs")
         if n_cmd:
-            parts.append(f"{n_cmd:,} commands")
+            cmd_str = f"{n_cmd:,} commands"
+            if n_cmd_plugin:
+                cmd_str += f" + {n_cmd_plugin:,} plugin"
+            parts.append(cmd_str)
+        elif n_cmd_plugin:
+            parts.append(f"{n_cmd_plugin:,} plugin commands")
         self.status_lbl.setText(("Loaded " + " · ".join(parts)) if parts else "No data loaded.")
 
     # ── Filtering ─────────────────────────────────────────────────────────────
@@ -425,13 +497,25 @@ class DatarefTab(QWidget):
         visible = self._proxy.rowCount()
         total = len(self._all_rows)
         if visible == total:
-            n_dr = sum(1 for r in self._all_rows if r.kind == _KIND_DATAREF)
-            n_cmd = sum(1 for r in self._all_rows if r.kind == _KIND_COMMAND)
+            n_dr = sum(1 for r in self._all_rows if r.kind == _KIND_DATAREF and r.source == "xplane")
+            n_dr_plugin = sum(1 for r in self._all_rows if r.kind == _KIND_DATAREF and r.source == "plugin")
+            n_cmd = sum(1 for r in self._all_rows if r.kind == _KIND_COMMAND and r.source == "xplane")
+            n_cmd_plugin = sum(1 for r in self._all_rows if r.kind == _KIND_COMMAND and r.source == "plugin")
             parts = []
             if n_dr:
-                parts.append(f"{n_dr:,} datarefs")
+                dr_str = f"{n_dr:,} datarefs"
+                if n_dr_plugin:
+                    dr_str += f" + {n_dr_plugin:,} plugin"
+                parts.append(dr_str)
+            elif n_dr_plugin:
+                parts.append(f"{n_dr_plugin:,} plugin datarefs")
             if n_cmd:
-                parts.append(f"{n_cmd:,} commands")
+                cmd_str = f"{n_cmd:,} commands"
+                if n_cmd_plugin:
+                    cmd_str += f" + {n_cmd_plugin:,} plugin"
+                parts.append(cmd_str)
+            elif n_cmd_plugin:
+                parts.append(f"{n_cmd_plugin:,} plugin commands")
             self.status_lbl.setText(("Loaded " + " · ".join(parts)) if parts else "No data loaded.")
         else:
             self.status_lbl.setText(f"Showing {visible:,} of {total:,}")

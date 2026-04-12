@@ -84,6 +84,34 @@ def parse_commands(path: str | Path) -> list[CommandRecord]:
     return records
 
 
+def parse_drt_datarefs(path: str | Path) -> list[str]:
+    """Return dataref names from a drt_last_run_datarefs.txt file (names only, one per line)."""
+    names: list[str] = []
+    p = Path(path)
+    if not p.is_file():
+        return names
+    with p.open(encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            name = raw.strip()
+            if name:
+                names.append(name)
+    return names
+
+
+def parse_drt_commands(path: str | Path) -> list[str]:
+    """Return command names from a drt_last_run_commandrefs.txt file (names only, one per line)."""
+    names: list[str] = []
+    p = Path(path)
+    if not p.is_file():
+        return names
+    with p.open(encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            name = raw.strip()
+            if name:
+                names.append(name)
+    return names
+
+
 def default_datarefs_path() -> Path | None:
     """Try common X-Plane install locations for DataRefs.txt."""
     candidates = [
@@ -103,6 +131,30 @@ def default_commands_path() -> Path | None:
         Path.home() / "X-Plane 12" / "Resources" / "plugins" / "Commands.txt",
         Path.home() / "X-Plane 11" / "Resources" / "plugins" / "Commands.txt",
         Path("/Applications/X-Plane 12/Resources/plugins/Commands.txt"),
+    ]
+    for c in candidates:
+        if c.is_file():
+            return c
+    return None
+
+
+def default_drt_datarefs_path() -> Path | None:
+    """Try common X-Plane output locations for drt_last_run_datarefs.txt."""
+    candidates = [
+        Path.home() / "X-Plane 12" / "Output" / "preferences" / "drt_last_run_datarefs.txt",
+        Path.home() / "X-Plane 11" / "Output" / "preferences" / "drt_last_run_datarefs.txt",
+    ]
+    for c in candidates:
+        if c.is_file():
+            return c
+    return None
+
+
+def default_drt_commands_path() -> Path | None:
+    """Try common X-Plane output locations for drt_last_run_commandrefs.txt."""
+    candidates = [
+        Path.home() / "X-Plane 12" / "Output" / "preferences" / "drt_last_run_commandrefs.txt",
+        Path.home() / "X-Plane 11" / "Output" / "preferences" / "drt_last_run_commandrefs.txt",
     ]
     for c in candidates:
         if c.is_file():
