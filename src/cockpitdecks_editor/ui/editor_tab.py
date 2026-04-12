@@ -4052,7 +4052,7 @@ class EditorTab(QWidget):
         cmd = bool(modifiers & Qt.KeyboardModifier.ControlModifier) # Command on macOS
 
         if shift and self._selected_button_id is not None:
-            # Range-select: add all buttons between last anchor and this one
+            # Shift+Click: range-add from anchor to this button
             last_idx = self._button_index(self._visual_buttons.get(self._selected_button_id, {}))
             this_idx = self._button_index(self._visual_buttons.get(button_id, {}))
             if last_idx is not None and this_idx is not None:
@@ -4063,7 +4063,7 @@ class EditorTab(QWidget):
                         self._selected_button_ids.add(bid)
             self._selected_button_id = button_id
         elif cmd:
-            # Command+Click: toggle this button
+            # Cmd+Click: toggle this button in/out of the multi-selection
             if button_id in self._selected_button_ids:
                 self._selected_button_ids.discard(button_id)
                 if self._selected_button_id == button_id:
@@ -4072,7 +4072,12 @@ class EditorTab(QWidget):
                 self._selected_button_ids.add(button_id)
                 self._selected_button_id = button_id
         else:
-            # Plain click: ignore for selection (standard UX remains stable)
+            # Plain click: select only this button, clearing any previous multi-selection.
+            # Does not open the designer — use the context menu or double-click for that.
+            self._selected_button_ids = {button_id}
+            self._selected_button_id = button_id
+            self._apply_selection_highlights()
+            self._refresh_selected_button_panel()
             return
 
         self._apply_selection_highlights()
