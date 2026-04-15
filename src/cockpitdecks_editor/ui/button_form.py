@@ -150,6 +150,37 @@ _REPRESENTATION_ROOT_FIELDS = {
     "vibrate",
 }
 
+# Keys stripped from the top-level data dict before re-serialising in _collect().
+# Any key managed by the form (activation block, representation block, legacy
+# top-level shorthand fields) must be listed here so stale data is not carried
+# forward when the user changes activation type or representation style.
+_COLLECT_MANAGED_ROOT_KEYS: frozenset[str] = frozenset({
+    "activation",
+    "representation",
+    "commands",
+    "page",
+    "pages",
+    "positions",
+    "deck",
+    "label",
+    "label-size",
+    "label-color",
+    "text",
+    "text-size",
+    "text-color",
+    "text-format",
+    "formula",
+    "annunciator",
+    "gauge",
+    "display",
+})
+
+# Keys managed inside the activation block (type overrides, command routing, navigation).
+_COLLECT_MANAGED_ACT_KEYS: frozenset[str] = frozenset({
+    "type", "commands", "page", "pages", "positions", "step", "minimum-distance",
+    "set-dataref", "value-min", "value-max", "value-step",
+})
+
 # ── Annunciator parts widget ─────────────────────────────────────────────────
 
 _ANN_LED_CHOICES = [
@@ -324,8 +355,6 @@ class ButtonFormWidget(QWidget):
         super().__init__(parent)
         self._syncing = False
         self._current_data: dict = {}
-        self._current_style: str = "standard"
-        self._rep_stash: dict[str, dict] = {}  # style → saved style-specific keys
 
         main_vbox = QVBoxLayout(self)
         main_vbox.setContentsMargins(0, 0, 0, 0)
@@ -482,6 +511,46 @@ class ButtonFormWidget(QWidget):
         self._sweep_positions_row = self.sweep_positions_edit
         self._act_form.addRow("Positions", self._sweep_positions_row)
 
+        # Swipe-specific fields
+        self.swipe_step_spin = _NoWheelSpinBox()
+        self.swipe_step_spin.setRange(1, 9999)
+        self.swipe_step_spin.setValue(50)
+        self.swipe_step_spin.setToolTip("Pixels of swipe per command repeat (default 50)")
+        self._swipe_step_row = self.swipe_step_spin
+        self._act_form.addRow("Step (px)", self._swipe_step_row)
+
+        self.swipe_min_distance_spin = _NoWheelSpinBox()
+        self.swipe_min_distance_spin.setRange(1, 9999)
+        self.swipe_min_distance_spin.setValue(20)
+        self.swipe_min_distance_spin.setToolTip("Minimum swipe distance in pixels to trigger a command (default 20)")
+        self._swipe_min_distance_row = self.swipe_min_distance_spin
+        self._act_form.addRow("Min Distance (px)", self._swipe_min_distance_row)
+
+        # Slider-specific fields
+        self.slider_dataref_edit = QLineEdit()
+        self.slider_dataref_edit.setPlaceholderText("sim/flightmodel/engine/ENGN_thro[0]")
+        self.slider_dataref_edit.setToolTip("Dataref to write when slider position changes")
+        self._slider_dataref_row = self.slider_dataref_edit
+        self._act_form.addRow("Set Dataref", self._slider_dataref_row)
+
+        self.slider_min_edit = QLineEdit()
+        self.slider_min_edit.setPlaceholderText("0")
+        self.slider_min_edit.setToolTip("Value written when slider is at its minimum position")
+        self._slider_min_row = self.slider_min_edit
+        self._act_form.addRow("Value Min", self._slider_min_row)
+
+        self.slider_max_edit = QLineEdit()
+        self.slider_max_edit.setPlaceholderText("1")
+        self.slider_max_edit.setToolTip("Value written when slider is at its maximum position")
+        self._slider_max_row = self.slider_max_edit
+        self._act_form.addRow("Value Max", self._slider_max_row)
+
+        self.slider_step_edit = QLineEdit()
+        self.slider_step_edit.setPlaceholderText("0 (continuous)")
+        self.slider_step_edit.setToolTip("Snap step size (0 = continuous, no snapping)")
+        self._slider_step_row = self.slider_step_edit
+        self._act_form.addRow("Step", self._slider_step_row)
+
         act_layout.addLayout(self._act_form)
         root.addWidget(act_frame)
 
@@ -551,6 +620,12 @@ class ButtonFormWidget(QWidget):
         ]:
             getattr(widget, sig).connect(self._on_form_changed)
         self.sweep_positions_edit.textChanged.connect(self._on_form_changed)
+        self.swipe_step_spin.valueChanged.connect(self._on_form_changed)
+        self.swipe_min_distance_spin.valueChanged.connect(self._on_form_changed)
+        self.slider_dataref_edit.textChanged.connect(self._on_form_changed)
+        self.slider_min_edit.textChanged.connect(self._on_form_changed)
+        self.slider_max_edit.textChanged.connect(self._on_form_changed)
+        self.slider_step_edit.textChanged.connect(self._on_form_changed)
 
     def _create_dynamic_rep_widget(self, field: dict, value: Any) -> QWidget:
         field_type = str(field.get("type") or "string")
@@ -566,7 +641,6 @@ class ButtonFormWidget(QWidget):
             for choice in field.get("choices") or []:
                 combo.addItem(str(choice), str(choice))
             combo.currentIndexChanged.connect(self._on_form_changed)
-            combo.currentTextChanged.connect(self._on_form_changed)
             if value not in (None, ""):
                 _set_combo(combo, str(value))
             elif field.get("default") not in (None, ""):
@@ -774,7 +848,7 @@ class ButtonFormWidget(QWidget):
             return widget.collect()
         field_type = str(field.get("type") or "string")
         if field_type == "boolean":
-            return widget.isChecked() or None
+            return True if widget.isChecked() else None
         if field_type == "choice":
             text = widget.currentText().strip()
             return text or None
@@ -860,15 +934,21 @@ class ButtonFormWidget(QWidget):
             self.pages_edit.setText(", ".join(str(p).strip() for p in pages if str(p).strip()))
             positions = activation_cfg.get("positions") if isinstance(activation_cfg.get("positions"), list) else []
             self.sweep_positions_edit.setPlainText("\n".join(str(p) for p in positions))
+            try:
+                self.swipe_step_spin.setValue(max(1, int(activation_cfg.get("step") or 50)))
+            except (ValueError, TypeError):
+                self.swipe_step_spin.setValue(50)
+            try:
+                self.swipe_min_distance_spin.setValue(max(1, int(activation_cfg.get("minimum-distance") or 20)))
+            except (ValueError, TypeError):
+                self.swipe_min_distance_spin.setValue(20)
+            self.slider_dataref_edit.setText(str(activation_cfg.get("set-dataref") or ""))
+            self.slider_min_edit.setText(str(activation_cfg.get("value-min") if activation_cfg.get("value-min") is not None else "0"))
+            self.slider_max_edit.setText(str(activation_cfg.get("value-max") if activation_cfg.get("value-max") is not None else "1"))
+            self.slider_step_edit.setText(str(activation_cfg.get("value-step") or ""))
         finally:
             self._syncing = False
-        self._current_style = style
         self._update_visibility()
-
-    def clear_stash(self) -> None:
-        """Discard saved per-representation data (call when loading a new button)."""
-        self._rep_stash.clear()
-        self._current_style = "standard"
 
     def populate_fonts(self, font_names: list[str]) -> None:
         """Reload font combos with available font names (call after target is set)."""
@@ -899,6 +979,45 @@ class ButtonFormWidget(QWidget):
     def _on_form_changed(self) -> None:
         if self._syncing:
             return
+
+        # When the annunciator model field changes, the parts widget must be
+        # rebuilt to match the new model's part count.  Detect this before the
+        # normal _collect() so the rebuilt widget is already in place.
+        style = str(self.style_combo.currentData() or "standard")
+        if style == "annunciator":
+            model_widget = self._dynamic_rep_widgets.get("model")
+            if model_widget is not None:
+                if isinstance(model_widget, QComboBox):
+                    new_model = str(model_widget.currentData() or model_widget.currentText()).strip()
+                elif isinstance(model_widget, QLineEdit):
+                    new_model = model_widget.text().strip()
+                else:
+                    new_model = ""
+                if new_model:
+                    rep_cfg = self._current_data.get("representation") if isinstance(self._current_data.get("representation"), dict) else {}
+                    ann_cfg = rep_cfg.get("annunciator") if isinstance(rep_cfg.get("annunciator"), dict) else {}
+                    old_model = str(ann_cfg.get("model") or "A")
+                    if new_model != old_model:
+                        # Preserve any edits already made to the parts widget
+                        existing_parts_widget = self._dynamic_rep_widgets.get("parts")
+                        current_parts = existing_parts_widget.collect() if isinstance(existing_parts_widget, AnnunciatorPartsWidget) else None
+
+                        updated_data = dict(self._current_data)
+                        updated_rep = dict(rep_cfg)
+                        updated_ann = dict(ann_cfg)
+                        updated_ann["model"] = new_model
+                        if current_parts is not None:
+                            updated_ann["parts"] = current_parts
+                        updated_rep["annunciator"] = updated_ann
+                        updated_data["representation"] = updated_rep
+                        self._current_data = updated_data
+
+                        self._syncing = True
+                        try:
+                            self._rebuild_dynamic_rep_form(style, updated_data)
+                        finally:
+                            self._syncing = False
+
         data = self._collect()
         self.form_changed.emit(yaml.safe_dump(data, sort_keys=False, allow_unicode=False))
 
@@ -909,11 +1028,13 @@ class ButtonFormWidget(QWidget):
         is_page = action_type in {"page", "page-cycle"}
         is_page_cycle = action_type == "page-cycle"
         is_command_like = action_type not in {"none", "page", "page-cycle", "swipe", "encoder", "encoder-push", "encoder-mode", "encoder-toggle", "encoder-value", "encoder-value-extended"}
-        is_two_command = action_type in {"encoder-toggle", "short-or-long-press"}
+        is_two_command = action_type in {"encoder-toggle", "short-or-long-press", "swipe"}
+        is_swipe = action_type == "swipe"
         is_encoder = action_type in {"encoder", "encoder-push", "encoder-mode", "encoder-toggle", "encoder-value", "encoder-value-extended"}
         is_encoder_push = action_type in {"encoder-push", "encoder-value", "encoder-value-extended"}
         is_encoder_mode = action_type == "encoder-mode"
         is_sweep = action_type == "sweep"
+        is_slider = action_type == "slider"
 
         _set_form_row_visible(self._act_form, self._command_row, is_command_like)
         _set_form_row_visible(self._act_form, self._pair_row, is_two_command)
@@ -926,6 +1047,12 @@ class ButtonFormWidget(QWidget):
         _set_form_row_visible(self._act_form, self._enc_cw_off_row, is_encoder_mode)
         _set_form_row_visible(self._act_form, self._enc_ccw_off_row, is_encoder_mode)
         _set_form_row_visible(self._act_form, self._sweep_positions_row, is_sweep)
+        _set_form_row_visible(self._act_form, self._swipe_step_row, is_swipe)
+        _set_form_row_visible(self._act_form, self._swipe_min_distance_row, is_swipe)
+        _set_form_row_visible(self._act_form, self._slider_dataref_row, is_slider)
+        _set_form_row_visible(self._act_form, self._slider_min_row, is_slider)
+        _set_form_row_visible(self._act_form, self._slider_max_row, is_slider)
+        _set_form_row_visible(self._act_form, self._slider_step_row, is_slider)
 
         if action_type == "encoder-toggle":
             self.command1_label.setText("On")
@@ -933,6 +1060,9 @@ class ButtonFormWidget(QWidget):
         elif action_type == "short-or-long-press":
             self.command1_label.setText("Short")
             self.command2_label.setText("Long")
+        elif action_type == "swipe":
+            self.command1_label.setText("Up / Left")
+            self.command2_label.setText("Down / Right")
 
         _set_form_row_visible(self._rep_form, self._dynamic_rep_row, True)
         self.rep_title.setText("Representation")
@@ -945,26 +1075,7 @@ class ButtonFormWidget(QWidget):
         data = {
             key: value
             for key, value in dict(self._current_data).items()
-            if key not in {
-                "activation",
-                "representation",
-                "commands",
-                "page",
-                "pages",
-                "positions",
-                "deck",
-                "label",
-                "label-size",
-                "label-color",
-                "text",
-                "text-size",
-                "text-color",
-                "text-format",
-                "formula",
-                "annunciator",
-                "gauge",
-                "display",
-            }
+            if key not in _COLLECT_MANAGED_ROOT_KEYS
         }
 
         if sender is self.family_combo:
@@ -1010,8 +1121,7 @@ class ButtonFormWidget(QWidget):
 
         # Activation
         current_activation = self._current_data.get("activation") if isinstance(self._current_data.get("activation"), dict) else {}
-        _managed_act_keys = {"type", "commands", "page", "pages", "positions"}
-        activation_obj: dict = {k: v for k, v in current_activation.items() if k not in _managed_act_keys}
+        activation_obj: dict = {k: v for k, v in current_activation.items() if k not in _COLLECT_MANAGED_ACT_KEYS}
         activation_obj["type"] = action_type
         if cmds:
             activation_obj["commands"] = cmds
@@ -1024,7 +1134,27 @@ class ButtonFormWidget(QWidget):
         
         if action_type == "sweep":
             activation_obj["positions"] = [ln.strip() for ln in self.sweep_positions_edit.toPlainText().splitlines() if ln.strip()]
-            
+        if action_type == "swipe":
+            activation_obj["step"] = self.swipe_step_spin.value()
+            activation_obj["minimum-distance"] = self.swipe_min_distance_spin.value()
+        if action_type == "slider":
+            dr = self.slider_dataref_edit.text().strip()
+            if dr:
+                activation_obj["set-dataref"] = dr
+            for key, edit in [("value-min", self.slider_min_edit), ("value-max", self.slider_max_edit)]:
+                raw = edit.text().strip()
+                if raw:
+                    try:
+                        activation_obj[key] = float(raw)
+                    except ValueError:
+                        activation_obj[key] = raw
+            step_raw = self.slider_step_edit.text().strip()
+            if step_raw:
+                try:
+                    activation_obj["value-step"] = float(step_raw)
+                except ValueError:
+                    pass
+
         data["activation"] = activation_obj
 
         # Representation — Dynamic fields

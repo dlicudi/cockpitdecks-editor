@@ -7,7 +7,7 @@ from pathlib import Path
 
 import yaml
 from PySide6.QtCore import QPoint, QMimeData, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QDrag, QFont, QKeySequence, QMouseEvent, QPixmap, QTextOption, QPainter, QPainterPath, QResizeEvent
+from PySide6.QtGui import QColor, QDesktopServices, QDrag, QFont, QKeySequence, QMouseEvent, QPixmap, QTextOption, QPainter, QPainterPath, QResizeEvent, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QGraphicsDropShadowEffect,
     QGridLayout,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -204,6 +205,7 @@ _REPRESENTATION_SCHEMA: dict[str, list[tuple[str, str]]] = {
         ("gauge", "Gauge"),
         ("tape", "Tape"),
         ("compass", "Compass"),
+        ("slider-icon", "Slider"),
     ],
     "Hardware": [
         ("led", "LED"),
@@ -265,6 +267,8 @@ def _two_command_fields(action_type: str) -> tuple[str, str] | None:
         return ("toggle-on", "toggle-off")
     if action_type == "short-or-long-press":
         return ("press", "long-press")
+    if action_type == "swipe":
+        return ("up", "down")
     return None
 
 
@@ -284,6 +288,10 @@ def _button_preview_validation_error(data: dict) -> str | None:
         fields = _two_command_fields(action_type)
         if fields is None or not all(str(commands.get(field) or "").strip() for field in fields):
             return "Short / Long Press needs short and long commands."
+    if action_type == "swipe":
+        fields = _two_command_fields(action_type)
+        if fields is None or not any(str(commands.get(field) or "").strip() for field in fields):
+            return "Swipe needs at least one command (up or down)."
     if action_type == "page" and not str(activation_cfg.get("page") or data.get("page") or "").strip():
         return "Load Page needs a page name."
     if action_type == "page-cycle":
@@ -333,8 +341,7 @@ class _VisualButtonCard(QFrame):
             self.setMinimumSize(self._size, self._size)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
-        self._selection_effect = None
-        
+
         # Persistence for dynamic resizing
         self._last_pixmap = preview
         self._last_status = preview_status
@@ -386,35 +393,62 @@ class _VisualButtonCard(QFrame):
                 preview_label = QLabel()
                 preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 preview_label.setStyleSheet("border: none;")
+                preview_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+                
                 target_w = max(1, self.width())
                 target_h = max(1, self.height())
-                preview_label.setFixedSize(target_w, target_h)
+                safe_w = max(1, target_w - 4)
+                safe_h = max(1, target_h - 4)
+                
                 src = QPixmap(preview)
                 scaled = src.scaled(
-                    target_w,
-                    target_h,
+                    safe_w,
+                    safe_h,
                     Qt.AspectRatioMode.KeepAspectRatio,
                     Qt.TransformationMode.SmoothTransformation,
                 )
-                canvas = QPixmap(target_w, target_h)
-                canvas.fill(Qt.GlobalColor.transparent)
+                
+                canvas_w = scaled.width() + 4
+                canvas_h = scaled.height() + 4
+                preview_label.setFixedSize(canvas_w, canvas_h)
 
-                rounded = QPixmap(canvas.size())
+                rounded = QPixmap(canvas_w, canvas_h)
                 rounded.fill(Qt.GlobalColor.transparent)
                 painter = QPainter(rounded)
                 painter.setRenderHint(QPainter.RenderHint.Antialiasing)
                 painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+                
+                is_selected = getattr(self, "_selected", False)
+                if self._dark:
+                    sel_border = QColor(251, 146, 60, 255)
+                    sel_bg = QColor(251, 146, 60, 46)
+                else:
+                    sel_border = QColor(249, 115, 22, 255)
+                    sel_bg = QColor(249, 115, 22, 25)
+                
+                img_x, img_y = 2, 2
                 path = QPainterPath()
                 radius = 8.0
-                path.addRoundedRect(0, 0, target_w, target_h, radius, radius)
+                path.addRoundedRect(img_x, img_y, scaled.width(), scaled.height(), radius, radius)
+                
+                if is_selected:
+                    painter.fillPath(path, sel_bg)
+                    
                 painter.setClipPath(path)
-                x = max(0, (target_w - scaled.width()) // 2)
-                y = max(0, (target_h - scaled.height()) // 2)
-                painter.drawPixmap(x, y, scaled)
+                painter.drawPixmap(img_x, img_y, scaled)
+                
+                painter.setClipping(False)
+                if is_selected:
+                    pen = QPen(sel_border, 2)
+                    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                    painter.setPen(pen)
+                    painter.drawPath(path)
+
                 painter.end()
                 preview_label.setPixmap(rounded)
                 if shiboken is not None and shiboken.isValid(self._layout):
                     self._layout.addWidget(preview_label, 1)
+                self._apply_theme()
                 return
 
             activation_cfg = self.button_data.get("activation") if isinstance(self.button_data.get("activation"), dict) else {}
@@ -442,7 +476,8 @@ class _VisualButtonCard(QFrame):
             title_label = QLabel(title)
             title_label.setWordWrap(True)
             title_label.setStyleSheet(f"font-size: {max(9, int(12 * self._scale))}px; font-weight: 700; color: {self._fg_primary};")
-            
+            title_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
             if shiboken is not None and shiboken.isValid(self._layout):
                 self._layout.addWidget(title_label)
 
@@ -450,12 +485,14 @@ class _VisualButtonCard(QFrame):
                     subtitle_label = QLabel(subtitle)
                     subtitle_label.setWordWrap(True)
                     subtitle_label.setStyleSheet(f"font-size: {max(8, int(10 * self._scale))}px; color: {self._fg_secondary};")
+                    subtitle_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
                     self._layout.addWidget(subtitle_label)
 
                 if preview_status:
                     status_label = QLabel(preview_status)
                     status_label.setWordWrap(True)
                     status_label.setStyleSheet(f"font-size: {max(7, int(9 * self._scale))}px; color: {self._fg_secondary};")
+                    status_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
                     self._layout.addWidget(status_label)
                 else:
                     self._layout.addStretch(1)
@@ -484,12 +521,15 @@ class _VisualButtonCard(QFrame):
     def set_selected(self, selected: bool) -> None:
         self._selected = selected
         self._apply_theme()
+        if hasattr(self, "_last_pixmap") and self._last_pixmap is not None and not self._last_pixmap.isNull():
+            QTimer.singleShot(0, self._render_content)
 
     def _apply_theme(self) -> None:
         if shiboken is not None and not shiboken.isValid(self):
             return
         selected = getattr(self, "_selected", False)
-        pad = 2 if selected else 0
+        has_preview = hasattr(self, "_last_pixmap") and self._last_pixmap is not None and not self._last_pixmap.isNull()
+        pad = 2 if selected and not has_preview else 0
         if hasattr(self, "_layout") and self._layout is not None:
             try:
                 if shiboken is not None and shiboken.isValid(self._layout):
@@ -506,21 +546,12 @@ class _VisualButtonCard(QFrame):
             self._fg_secondary = "#64748b"
             sel_border = "#f97316"
             sel_bg = "rgba(249, 115, 22, 0.10)"
-        if selected:
+        if selected and not has_preview:
             try:
-                if self._selection_effect is None:
-                    self._selection_effect = QGraphicsDropShadowEffect(self)
-                    self._selection_effect.setBlurRadius(20)
-                    self._selection_effect.setColor(QColor(sel_border))
-                    self._selection_effect.setOffset(0)
-                self.setGraphicsEffect(self._selection_effect)
-            except (RuntimeError, AttributeError):
-                self._selection_effect = QGraphicsDropShadowEffect(self)
-                self._selection_effect.setBlurRadius(20)
-                self._selection_effect.setColor(QColor(sel_border))
-                self._selection_effect.setOffset(0)
-                self.setGraphicsEffect(self._selection_effect)
-            self.setStyleSheet(f"QFrame {{ background: {sel_bg}; border: 1px solid {sel_border}; border-radius: 8px; }}")
+                self.setGraphicsEffect(None)
+            except RuntimeError:
+                pass
+            self.setStyleSheet(f"QFrame {{ background: {sel_bg}; border: 2px solid {sel_border}; border-radius: 8px; }}")
         else:
             try:
                 self.setGraphicsEffect(None)
@@ -748,12 +779,12 @@ class _VisualGridHost(QWidget):
 
 
 class _GridSlot(QFrame):
-    dropped = Signal(str, int)
-    create_requested = Signal(int)
-    context_requested = Signal(int, QPoint)
+    dropped = Signal(str, object)
+    create_requested = Signal(object)
+    context_requested = Signal(object, QPoint)
     deselect_requested = Signal()
 
-    def __init__(self, index: int, *, dark: bool, scale: float = 1.0, parent: QWidget | None = None) -> None:
+    def __init__(self, index: int | str, *, dark: bool, scale: float = 1.0, width: int | None = None, height: int | None = None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.index = index
         self._dark = dark
@@ -761,9 +792,12 @@ class _GridSlot(QFrame):
         self._occupied = False
         self._selected = False
         self._force_hidden = False
+        self._drag_hover = False
         self.setAcceptDrops(True)
         self._selection_effect = None
-        self.setFixedSize(int(128 * self._scale), int(128 * self._scale))
+        w = width if width is not None else int(128 * self._scale)
+        h = height if height is not None else int(128 * self._scale)
+        self.setFixedSize(w, h)
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.setSpacing(0)
@@ -790,27 +824,41 @@ class _GridSlot(QFrame):
             fg = "#64748b"
             sel_bg = "rgba(251, 146, 60, 0.15)"
             sel_border = "#fb923c"
+            hover_bg = "rgba(96, 165, 250, 0.15)"
+            hover_border = "#60a5fa"
         else:
             empty_bg = "#ffffff"
             border = "#cbd5e1"
             fg = "#94a3b8"
             sel_bg = "rgba(249, 115, 22, 0.08)"
             sel_border = "#f97316"
+            hover_bg = "rgba(59, 130, 246, 0.10)"
+            hover_border = "#3b82f6"
         if self._force_hidden:
             self.setStyleSheet("QFrame { background: transparent; border: none; }")
             self._placeholder.setStyleSheet("color: transparent; border: none;")
+            return
+        if self._drag_hover:
+            try:
+                self.setGraphicsEffect(None)
+            except RuntimeError:
+                pass
+            self.setStyleSheet(
+                f"QFrame {{ background: {hover_bg}; border: 2px solid {hover_border}; border-radius: 8px; }}"
+            )
+            self._placeholder.setStyleSheet(f"font-size: {max(8, int(11 * self._scale))}px; color: {hover_border}; border: none;")
             return
         if self._selected and self._occupied:
             try:
                 if self._selection_effect is None:
                     self._selection_effect = QGraphicsDropShadowEffect(self)
-                    self._selection_effect.setBlurRadius(20)
+                    self._selection_effect.setBlurRadius(10)
                     self._selection_effect.setColor(QColor(sel_border))
                     self._selection_effect.setOffset(0)
                 self.setGraphicsEffect(self._selection_effect)
             except (RuntimeError, AttributeError):
                 self._selection_effect = QGraphicsDropShadowEffect(self)
-                self._selection_effect.setBlurRadius(20)
+                self._selection_effect.setBlurRadius(10)
                 self._selection_effect.setColor(QColor(sel_border))
                 self._selection_effect.setOffset(0)
                 self.setGraphicsEffect(self._selection_effect)
@@ -856,11 +904,20 @@ class _GridSlot(QFrame):
 
     def dragEnterEvent(self, event) -> None:
         if event.mimeData().hasText():
+            self._drag_hover = True
+            self._apply_theme()
             event.acceptProposedAction()
         else:
             event.ignore()
 
+    def dragLeaveEvent(self, event) -> None:
+        self._drag_hover = False
+        self._apply_theme()
+        super().dragLeaveEvent(event)
+
     def dropEvent(self, event) -> None:
+        self._drag_hover = False
+        self._apply_theme()
         if event.mimeData().hasText():
             self.dropped.emit(event.mimeData().text(), self.index)
             event.acceptProposedAction()
@@ -959,6 +1016,7 @@ class EditorTab(QWidget):
         self._visual_deck_name: str | None = None
         self._preview_cache: dict[str, QPixmap | None] = {}
         self._preview_errors: dict[str, str] = {}
+        self._preview_key_to_id: dict[str, str] = {}
         self._preview_inflight: set[str] = set()
         self._preview_queue: list[tuple[str, str, str, int]] = []
         self._suggestion_cache: dict[tuple[str, str], list[tuple[str, str]]] = {}
@@ -996,7 +1054,7 @@ class EditorTab(QWidget):
 
         self._save_clear_timer = QTimer(self)
         self._save_clear_timer.setSingleShot(True)
-        self._save_clear_timer.timeout.connect(lambda: self.modified_label.setText(""))
+        self._save_clear_timer.timeout.connect(lambda: self._clear_dirty_indicator())
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -1038,12 +1096,6 @@ class EditorTab(QWidget):
         self.btn_reveal_target.clicked.connect(self._reveal_target)
         toolbar_layout.addWidget(self.btn_reveal_target)
 
-        self.btn_save = QPushButton("Save")
-        self.btn_save.setShortcut(QKeySequence.StandardKey.Save)
-        self.btn_save.setEnabled(False)
-        self.btn_save.clicked.connect(self._save_current_and_apply_button)
-        toolbar_layout.addWidget(self.btn_save)
-
         root.addWidget(toolbar)
 
         body = QSplitter(Qt.Orientation.Horizontal)
@@ -1064,6 +1116,8 @@ class EditorTab(QWidget):
         self.file_tree.itemSelectionChanged.connect(self._on_tree_selection_changed)
         self.file_tree.itemClicked.connect(self._on_tree_item_clicked)
         self.file_tree.page_drop_requested.connect(self._drop_button_on_page)
+        self.file_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.file_tree.customContextMenuRequested.connect(self._show_tree_context_menu)
         left_layout.addWidget(self.file_tree, 1)
         body.addWidget(left)
 
@@ -1088,8 +1142,16 @@ class EditorTab(QWidget):
         self.file_label.linkActivated.connect(lambda _: self._close_button_editor_workspace())
         header.addWidget(self.file_label, 1)
 
-        self.modified_label = QLabel("")
-        header.addWidget(self.modified_label)
+        _BAR_BTN_H = 28
+        _BAR_BTN_QSS = "padding: 2px 10px;"
+
+        self.btn_save = QPushButton("Save")
+        self.btn_save.setShortcut(QKeySequence.StandardKey.Save)
+        self.btn_save.setFixedHeight(_BAR_BTN_H)
+        self.btn_save.setStyleSheet(_BAR_BTN_QSS)
+        self.btn_save.setEnabled(False)
+        self.btn_save.clicked.connect(self._save_current_and_apply_button)
+        header.addWidget(self.btn_save)
 
         self._view_zoom_bar = QWidget()
         _vzb = QHBoxLayout(self._view_zoom_bar)
@@ -1098,11 +1160,15 @@ class EditorTab(QWidget):
 
         self.btn_text_view = QPushButton("Text")
         self.btn_text_view.setCheckable(True)
+        self.btn_text_view.setFixedHeight(_BAR_BTN_H)
+        self.btn_text_view.setStyleSheet(_BAR_BTN_QSS)
         self.btn_text_view.clicked.connect(lambda: self._switch_mode("text"))
         _vzb.addWidget(self.btn_text_view)
 
         self.btn_visual_view = QPushButton("Visual")
         self.btn_visual_view.setCheckable(True)
+        self.btn_visual_view.setFixedHeight(_BAR_BTN_H)
+        self.btn_visual_view.setStyleSheet(_BAR_BTN_QSS)
         self.btn_visual_view.clicked.connect(lambda: self._switch_mode("visual"))
         _vzb.addWidget(self.btn_visual_view)
 
@@ -1113,14 +1179,20 @@ class EditorTab(QWidget):
         self.btn_text_view.setChecked(True)
 
         self.btn_zoom_out = QPushButton("−")
+        self.btn_zoom_out.setFixedHeight(_BAR_BTN_H)
+        self.btn_zoom_out.setStyleSheet(_BAR_BTN_QSS)
         self.btn_zoom_out.clicked.connect(lambda: self._set_visual_zoom(self._visual_zoom - 0.1))
         _vzb.addWidget(self.btn_zoom_out)
 
         self.btn_zoom_fit = QPushButton("Fit")
+        self.btn_zoom_fit.setFixedHeight(_BAR_BTN_H)
+        self.btn_zoom_fit.setStyleSheet(_BAR_BTN_QSS)
         self.btn_zoom_fit.clicked.connect(self._fit_visual_zoom)
         _vzb.addWidget(self.btn_zoom_fit)
 
         self.btn_zoom_in = QPushButton("+")
+        self.btn_zoom_in.setFixedHeight(_BAR_BTN_H)
+        self.btn_zoom_in.setStyleSheet(_BAR_BTN_QSS)
         self.btn_zoom_in.clicked.connect(lambda: self._set_visual_zoom(self._visual_zoom + 0.1))
         _vzb.addWidget(self.btn_zoom_in)
 
@@ -1388,6 +1460,42 @@ class EditorTab(QWidget):
         )
         self.visual_sweep_positions_row = self.visual_sweep_positions_edit
         activation_form.addRow("Positions", self.visual_sweep_positions_row)
+
+        self.visual_swipe_step_spin = _NoWheelSpinBox()
+        self.visual_swipe_step_spin.setRange(1, 9999)
+        self.visual_swipe_step_spin.setValue(1)
+        self.visual_swipe_step_spin.setToolTip("Pixels per step reported to the activation")
+        self.visual_swipe_step_row = self.visual_swipe_step_spin
+        activation_form.addRow("Step", self.visual_swipe_step_row)
+
+        self.visual_swipe_min_distance_spin = _NoWheelSpinBox()
+        self.visual_swipe_min_distance_spin.setRange(1, 9999)
+        self.visual_swipe_min_distance_spin.setValue(1)
+        self.visual_swipe_min_distance_spin.setToolTip("Minimum swipe distance (pixels) to register a gesture")
+        self.visual_swipe_min_distance_row = self.visual_swipe_min_distance_spin
+        activation_form.addRow("Min Distance", self.visual_swipe_min_distance_row)
+
+        # Slider-specific fields
+        self.visual_slider_dataref_edit = QLineEdit()
+        self.visual_slider_dataref_edit.setPlaceholderText("sim/flightmodel/engine/ENGN_thro[0]")
+        self.visual_slider_dataref_edit.setToolTip("Dataref written when the slider is dragged")
+        self.visual_slider_dataref_row = self.visual_slider_dataref_edit
+        activation_form.addRow("Set Dataref", self.visual_slider_dataref_row)
+
+        self.visual_slider_min_edit = QLineEdit()
+        self.visual_slider_min_edit.setPlaceholderText("0")
+        self.visual_slider_min_row = self.visual_slider_min_edit
+        activation_form.addRow("Value Min", self.visual_slider_min_row)
+
+        self.visual_slider_max_edit = QLineEdit()
+        self.visual_slider_max_edit.setPlaceholderText("1")
+        self.visual_slider_max_row = self.visual_slider_max_edit
+        activation_form.addRow("Value Max", self.visual_slider_max_row)
+
+        self.visual_slider_step_edit = QLineEdit()
+        self.visual_slider_step_edit.setPlaceholderText("0 (continuous)")
+        self.visual_slider_step_row = self.visual_slider_step_edit
+        activation_form.addRow("Step", self.visual_slider_step_row)
 
         activation_layout.addLayout(activation_form)
 
@@ -1660,6 +1768,65 @@ class EditorTab(QWidget):
         representation_form.addRow("Tick Labels", self.visual_gauge_tick_labels_row)
         # ── end gauge fields ─────────────────────────────────────────────────────
 
+        # ── circular-switch fields ───────────────────────────────────────────────
+        cs_angle_range_row = QWidget()
+        cs_angle_range_layout = QHBoxLayout(cs_angle_range_row)
+        cs_angle_range_layout.setContentsMargins(0, 0, 0, 0)
+        cs_angle_range_layout.setSpacing(6)
+        self.visual_cs_angle_start = _NoWheelSpinBox()
+        self.visual_cs_angle_start.setRange(0, 359)
+        self.visual_cs_angle_start.setValue(280)
+        self.visual_cs_angle_end = _NoWheelSpinBox()
+        self.visual_cs_angle_end.setRange(0, 359)
+        self.visual_cs_angle_end.setValue(90)
+        cs_angle_range_layout.addWidget(QLabel("Start"))
+        cs_angle_range_layout.addWidget(self.visual_cs_angle_start)
+        cs_angle_range_layout.addWidget(QLabel("End"))
+        cs_angle_range_layout.addWidget(self.visual_cs_angle_end)
+        cs_angle_range_layout.addStretch()
+        self.visual_cs_angle_range_row = cs_angle_range_row
+        representation_form.addRow("Angle Range", self.visual_cs_angle_range_row)
+
+        self.visual_cs_ticks = QPlainTextEdit()
+        self.visual_cs_ticks.setPlaceholderText("One label per stop\n(e.g. GRD\nOFF\nCONT\nFLT)")
+        self.visual_cs_ticks.setFixedHeight(90)
+        self.visual_cs_ticks_row = self.visual_cs_ticks
+        representation_form.addRow("Ticks", self.visual_cs_ticks_row)
+        # ── end circular-switch fields ───────────────────────────────────────────
+
+        # ── slider-icon representation fields ────────────────────────────────────
+        self.visual_slider_icon_label_edit = QLineEdit()
+        self.visual_slider_icon_label_edit.setPlaceholderText("e.g. POWER")
+        self.visual_slider_icon_label_row = self.visual_slider_icon_label_edit
+        representation_form.addRow("Label", self.visual_slider_icon_label_row)
+
+        self.visual_slider_icon_fill_edit = QLineEdit()
+        self.visual_slider_icon_fill_edit.setPlaceholderText("cyan")
+        self.visual_slider_icon_fill_row = self.visual_slider_icon_fill_edit
+        representation_form.addRow("Fill Colour", self.visual_slider_icon_fill_row)
+
+        self.visual_slider_icon_track_edit = QLineEdit()
+        self.visual_slider_icon_track_edit.setPlaceholderText("#323232")
+        self.visual_slider_icon_track_row = self.visual_slider_icon_track_edit
+        representation_form.addRow("Track Colour", self.visual_slider_icon_track_row)
+
+        self.visual_slider_icon_orientation_combo = _NoWheelComboBox()
+        for _lbl, _val in [("Vertical", "vertical"), ("Horizontal", "horizontal")]:
+            self.visual_slider_icon_orientation_combo.addItem(_lbl, _val)
+        self.visual_slider_icon_orientation_row = self.visual_slider_icon_orientation_combo
+        representation_form.addRow("Orientation", self.visual_slider_icon_orientation_row)
+
+        self.visual_slider_icon_min_edit = QLineEdit()
+        self.visual_slider_icon_min_edit.setPlaceholderText("0")
+        self.visual_slider_icon_min_row = self.visual_slider_icon_min_edit
+        representation_form.addRow("Value Min", self.visual_slider_icon_min_row)
+
+        self.visual_slider_icon_max_edit = QLineEdit()
+        self.visual_slider_icon_max_edit.setPlaceholderText("1")
+        self.visual_slider_icon_max_row = self.visual_slider_icon_max_edit
+        representation_form.addRow("Value Max", self.visual_slider_icon_max_row)
+        # ── end slider-icon fields ───────────────────────────────────────────────
+
         representation_layout.addLayout(representation_form)
         _visual_columns_layout.addWidget(self.visual_representation_section, 1, Qt.AlignmentFlag.AlignTop)
         visual_form_wrap.addWidget(_visual_columns, 1)
@@ -1717,6 +1884,8 @@ class EditorTab(QWidget):
             (self.visual_pages_edit, "textChanged"),
             (self.visual_deck_edit, "textChanged"),
             (self.visual_sweep_positions_edit, "textChanged"),
+            (self.visual_swipe_step_spin, "valueChanged"),
+            (self.visual_swipe_min_distance_spin, "valueChanged"),
             (self.visual_span_cols, "valueChanged"),
             (self.visual_span_rows, "valueChanged"),
             (self.visual_label_edit, "textChanged"),
@@ -1728,6 +1897,8 @@ class EditorTab(QWidget):
             (self.visual_ann_model, "currentIndexChanged"),
             (self.visual_ann_style, "currentIndexChanged"),
             (self.visual_ann_size, "currentIndexChanged"),
+            (self.visual_cs_angle_start, "valueChanged"),
+            (self.visual_cs_angle_end, "valueChanged"),
             (self.visual_gauge_tick_from, "valueChanged"),
             (self.visual_gauge_tick_to, "valueChanged"),
             (self.visual_gauge_ticks, "valueChanged"),
@@ -1739,9 +1910,20 @@ class EditorTab(QWidget):
             (self.visual_gauge_tick_width, "valueChanged"),
             (self.visual_gauge_tick_label_size, "valueChanged"),
             (self.visual_gauge_formula_edit, "textChanged"),
+            (self.visual_slider_dataref_edit, "textChanged"),
+            (self.visual_slider_min_edit, "textChanged"),
+            (self.visual_slider_max_edit, "textChanged"),
+            (self.visual_slider_step_edit, "textChanged"),
+            (self.visual_slider_icon_label_edit, "textChanged"),
+            (self.visual_slider_icon_fill_edit, "textChanged"),
+            (self.visual_slider_icon_track_edit, "textChanged"),
+            (self.visual_slider_icon_orientation_combo, "currentIndexChanged"),
+            (self.visual_slider_icon_min_edit, "textChanged"),
+            (self.visual_slider_icon_max_edit, "textChanged"),
         ):
             getattr(widget, signal_name).connect(self._apply_visual_fields_to_yaml)
         self.visual_gauge_tick_labels.textChanged.connect(self._apply_visual_fields_to_yaml)
+        self.visual_cs_ticks.textChanged.connect(self._apply_visual_fields_to_yaml)
         for row in self.visual_ann_part_rows:
             row["text_edit"].textChanged.connect(self._apply_visual_fields_to_yaml)
             row["font_combo"].currentTextChanged.connect(self._apply_visual_fields_to_yaml)
@@ -1978,7 +2160,7 @@ class EditorTab(QWidget):
         self._current_file_path = None
         self._set_editor_text("")
         self.file_label.setText("Select a config file")
-        self.modified_label.setText("")
+        self._clear_dirty_indicator()
         self._visual_reset()
         self.path_label.setText("No root open" if path is None else _short_path(path))
         self._warm_preview_pool_async(path)
@@ -2327,6 +2509,56 @@ class EditorTab(QWidget):
         if self._current_file_path is not None:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._current_file_path)))
 
+    def _show_tree_context_menu(self, pos: QPoint) -> None:
+        item = self.file_tree.itemAt(pos)
+        if item is None or self._current_target_path is None:
+            return
+        # Reconstruct the absolute path from the item hierarchy
+        parts: list[str] = []
+        cursor: QTreeWidgetItem | None = item
+        while cursor is not None:
+            parts.insert(0, cursor.text(0))
+            cursor = cursor.parent()
+        item_path = self._current_target_path / Path(*parts)
+        folder_path = item_path if item_path.is_dir() else item_path.parent
+        rel_folder = folder_path.relative_to(self._current_target_path)
+        # Offer "New Page" only for layout-like folders (not the root, not under resources/)
+        is_layout_folder = (
+            folder_path != self._current_target_path
+            and "resources" not in rel_folder.parts
+        )
+        menu = QMenu(self)
+        new_page_action = menu.addAction("New Page…") if is_layout_folder else None
+        reveal_action = menu.addAction("Reveal in Finder")
+        chosen = menu.exec(self.file_tree.viewport().mapToGlobal(pos))
+        if new_page_action and chosen is new_page_action:
+            self._create_new_page_in_folder(folder_path)
+        elif chosen is reveal_action:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder_path)))
+
+    def _create_new_page_in_folder(self, folder: Path) -> None:
+        name, ok = QInputDialog.getText(self, "New Page", "Page name (without .yaml):")
+        if not ok or not name.strip():
+            return
+        safe = re.sub(r"[^A-Za-z0-9_\-]", "_", name.strip())
+        if not safe:
+            QMessageBox.warning(self, "Invalid name", "The page name is not valid.")
+            return
+        page_path = folder / f"{safe}.yaml"
+        if page_path.exists():
+            QMessageBox.warning(self, "File exists", f"{page_path.name} already exists in this folder.")
+            return
+        stub = f"name: {safe}\nfill-empty-keys: false\nbuttons: []\n"
+        try:
+            page_path.write_text(stub, encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.warning(self, "Create failed", str(exc))
+            return
+        self.refresh_tree()
+        self._load_file(page_path)
+        self.status_label.setText(f"Created {page_path.name}")
+        self.log_line.emit(f"[editor] created page {page_path}")
+
     def _update_tree_dirty_state(self) -> None:
         current_path = str(self._current_file_path) if self._current_file_path is not None else None
         is_modified = self.editor.document().isModified()
@@ -2341,13 +2573,19 @@ class EditorTab(QWidget):
             for i in range(item.childCount()):
                 stack.append(item.child(i))
 
+    def _set_dirty_indicator(self, dirty: bool) -> None:
+        text = self.file_label.text()
+        base = text.rstrip(" ●")
+        self.file_label.setText(base + (" ●" if dirty else ""))
+
+    def _clear_dirty_indicator(self) -> None:
+        self._set_dirty_indicator(False)
+
     def _on_modification_changed(self, modified: bool) -> None:
         if self._loading_file:
             return
-        if modified:
-            self.modified_label.setText("Unsaved changes")
-        else:
-            self.modified_label.setText("Saved")
+        self._set_dirty_indicator(modified)
+        if not modified:
             self._save_clear_timer.start(2000)
         self._update_tree_dirty_state()
         self._update_action_state()
@@ -2370,7 +2608,7 @@ class EditorTab(QWidget):
         self._right_panel.setStyleSheet(common_panel)
         self.path_label.setStyleSheet(f"font-size: 11px; color: {subfg};")
         self.file_label.setStyleSheet(f"font-size: 12px; font-weight: 700; color: {fg};")
-        self.modified_label.setStyleSheet("font-size: 11px; color: #b45309; font-weight: 600;")
+        # dirty indicator is a suffix on file_label — no separate widget to style
         self.status_label.setStyleSheet(f"font-size: 11px; color: {subfg};")
         self.visual_hint.setStyleSheet(f"font-size: 11px; color: {subfg};")
         self.includes_bar_label.setStyleSheet(f"font-size: 11px; color: {subfg};")
@@ -2400,15 +2638,26 @@ class EditorTab(QWidget):
         for btn in (
             self.btn_refresh,
             self.btn_reveal_target,
+            self.btn_apply_preset,
+            self.btn_reveal_file,
+        ):
+            btn.setStyleSheet(button_style)
+        # File-name bar buttons: fixed height, tighter padding, same colours
+        bar_btn_style = (
+            f"QPushButton {{ min-height: 0; max-height: 28px; padding: 2px 10px; border-radius: 6px; border: 1px solid {border};"
+            f" background: {panel_bg}; color: {fg}; font-size: 11px; }}"
+            f"QPushButton:disabled {{ background: #e5e7eb; color: #94a3b8; border-color: {border}; }}"
+            f"QPushButton:checked {{ background: #dbeafe; color: #1d4ed8; border-color: #93c5fd; }}"
+        )
+        for btn in (
+            self.btn_save,
             self.btn_text_view,
             self.btn_visual_view,
             self.btn_zoom_out,
             self.btn_zoom_fit,
             self.btn_zoom_in,
-            self.btn_apply_preset,
-            self.btn_reveal_file,
         ):
-            btn.setStyleSheet(button_style)
+            btn.setStyleSheet(bar_btn_style)
         self.zoom_label.setStyleSheet(f"font-size: 11px; color: {subfg};")
         self._designer_panel.setStyleSheet(common_panel)
         self.config_form_section.setStyleSheet(common_panel)
@@ -2491,6 +2740,7 @@ class EditorTab(QWidget):
         self._preview_generation += 1
         self._preview_cache = {}
         self._preview_errors = {}
+        self._preview_key_to_id = {}
         self._preview_inflight = set()
         self._preview_queue = []
         self._preview_queue_keys = set()
@@ -2533,6 +2783,7 @@ class EditorTab(QWidget):
         self._preview_generation += 1
         self._preview_cache = {}
         self._preview_errors = {}
+        self._preview_key_to_id = {}
         self._preview_inflight = set()
         self._preview_queue = []
         self._preview_queue_keys = set()
@@ -2933,6 +3184,14 @@ class EditorTab(QWidget):
                 preserved["annunciator"] = ann
             else:
                 preserved.pop("annunciator", None)
+        if preserved.get("circular-switch") and str(self.visual_style_combo.currentData() or "") == "circular-switch":
+            cs = dict(preserved.get("circular-switch") or {})
+            for _k in ("angle-start", "angle-end", "tick-from", "tick-to", "ticks", "tick-labels"):
+                cs.pop(_k, None)
+            if cs:
+                preserved["circular-switch"] = cs
+            else:
+                preserved.pop("circular-switch", None)
         if preserved.get("gauge") and str(self.visual_style_combo.currentData() or "") == "gauge":
             gauge = dict(preserved.get("gauge") or {})
             for _k in ("tick-from", "tick-to", "ticks", "gauge-offset", "needle-color", "needle-width",
@@ -2942,6 +3201,14 @@ class EditorTab(QWidget):
                 preserved["gauge"] = gauge
             else:
                 preserved.pop("gauge", None)
+        if preserved.get("representation") and str(self.visual_style_combo.currentData() or "") == "slider-icon":
+            rep = dict(preserved.get("representation") or {})
+            rep.pop("slider-icon", None)
+            rep.pop("type", None)
+            if rep:
+                preserved["representation"] = rep
+            else:
+                preserved.pop("representation", None)
         self.button_advanced_preview.setPlainText(
             yaml.safe_dump(preserved or {"info": "No preserved advanced fields"}, sort_keys=False, allow_unicode=False)
         )
@@ -2953,11 +3220,15 @@ class EditorTab(QWidget):
         is_page = action_type == "page"
         is_page_cycle = action_type == "page-cycle"
         is_command_like = action_type in {"push", "begin-end-command"}
-        is_two_command = action_type in {"encoder-toggle", "short-or-long-press"}
+        is_two_command = action_type in {"encoder-toggle", "short-or-long-press", "swipe"}
         uses_remote_deck = action_type in {"page", "reload"}
         is_sweep = action_type == "sweep"
+        is_swipe = action_type == "swipe"
+        is_slider_act = action_type == "slider"
         is_annunciator = style == "annunciator"
         is_gauge = style == "gauge"
+        is_slider_icon = style == "slider-icon"
+        is_circular_switch = style == "circular-switch"
 
         _set_form_row_visible(self.visual_activation_form, self.visual_command_row, is_command_like)
         _set_form_row_visible(self.visual_activation_form, self.visual_command_pair_host, is_two_command)
@@ -2965,6 +3236,12 @@ class EditorTab(QWidget):
         _set_form_row_visible(self.visual_activation_form, self.visual_pages_row, is_page_cycle)
         _set_form_row_visible(self.visual_activation_form, self.visual_deck_row, uses_remote_deck)
         _set_form_row_visible(self.visual_activation_form, self.visual_sweep_positions_row, is_sweep)
+        _set_form_row_visible(self.visual_activation_form, self.visual_swipe_step_row, is_swipe)
+        _set_form_row_visible(self.visual_activation_form, self.visual_swipe_min_distance_row, is_swipe)
+        _set_form_row_visible(self.visual_activation_form, self.visual_slider_dataref_row, is_slider_act)
+        _set_form_row_visible(self.visual_activation_form, self.visual_slider_min_row, is_slider_act)
+        _set_form_row_visible(self.visual_activation_form, self.visual_slider_max_row, is_slider_act)
+        _set_form_row_visible(self.visual_activation_form, self.visual_slider_step_row, is_slider_act)
 
         if action_type == "encoder-toggle":
             self.visual_command1_label.setText("On")
@@ -2976,6 +3253,11 @@ class EditorTab(QWidget):
             self.visual_command2_label.setText("Long")
             self.visual_command1_edit.setPlaceholderText("Command for short press")
             self.visual_command2_edit.setPlaceholderText("Command for long press")
+        elif action_type == "swipe":
+            self.visual_command1_label.setText("Up / Left")
+            self.visual_command2_label.setText("Down / Right")
+            self.visual_command1_edit.setPlaceholderText("Command when swiping up or left")
+            self.visual_command2_edit.setPlaceholderText("Command when swiping down or right")
         else:
             self.visual_command1_label.setText("Primary")
             self.visual_command2_label.setText("Secondary")
@@ -2993,7 +3275,7 @@ class EditorTab(QWidget):
             self.visual_page_edit.setPlaceholderText("")
             self.visual_pages_edit.setPlaceholderText("")
 
-        show_basic_text = not is_annunciator and not is_gauge
+        show_basic_text = not is_annunciator and not is_gauge and not is_slider_icon and not is_circular_switch
         _set_form_row_visible(self.visual_representation_form, self.visual_label_color_row, is_gauge)
         _set_form_row_visible(self.visual_representation_form, self.visual_text_row, show_basic_text)
         _set_form_row_visible(self.visual_representation_form, self.visual_text_size_row, show_basic_text)
@@ -3007,6 +3289,14 @@ class EditorTab(QWidget):
         _set_form_row_visible(self.visual_representation_form, self.visual_gauge_ticks_style_row, is_gauge)
         _set_form_row_visible(self.visual_representation_form, self.visual_gauge_formula_row, is_gauge)
         _set_form_row_visible(self.visual_representation_form, self.visual_gauge_tick_labels_row, is_gauge)
+        _set_form_row_visible(self.visual_representation_form, self.visual_cs_angle_range_row, is_circular_switch)
+        _set_form_row_visible(self.visual_representation_form, self.visual_cs_ticks_row, is_circular_switch)
+        _set_form_row_visible(self.visual_representation_form, self.visual_slider_icon_label_row, is_slider_icon)
+        _set_form_row_visible(self.visual_representation_form, self.visual_slider_icon_fill_row, is_slider_icon)
+        _set_form_row_visible(self.visual_representation_form, self.visual_slider_icon_track_row, is_slider_icon)
+        _set_form_row_visible(self.visual_representation_form, self.visual_slider_icon_orientation_row, is_slider_icon)
+        _set_form_row_visible(self.visual_representation_form, self.visual_slider_icon_min_row, is_slider_icon)
+        _set_form_row_visible(self.visual_representation_form, self.visual_slider_icon_max_row, is_slider_icon)
         self._update_annunciator_part_rows()
 
     def _sync_visual_fields_from_doc(self) -> None:
@@ -3055,6 +3345,25 @@ class EditorTab(QWidget):
             self.visual_deck_edit.setText(str(data.get("deck") or ""))
             positions = activation_cfg.get("positions") if isinstance(activation_cfg.get("positions"), list) else []
             self.visual_sweep_positions_edit.setPlainText("\n".join(str(p) for p in positions))
+            try:
+                self.visual_swipe_step_spin.setValue(max(1, int(activation_cfg.get("step") or 1)))
+            except (ValueError, TypeError):
+                self.visual_swipe_step_spin.setValue(1)
+            try:
+                self.visual_swipe_min_distance_spin.setValue(max(1, int(activation_cfg.get("minimum-distance") or 1)))
+            except (ValueError, TypeError):
+                self.visual_swipe_min_distance_spin.setValue(1)
+            self.visual_slider_dataref_edit.setText(str(activation_cfg.get("set-dataref") or ""))
+            self.visual_slider_min_edit.setText(str(activation_cfg.get("value-min") if activation_cfg.get("value-min") is not None else ""))
+            self.visual_slider_max_edit.setText(str(activation_cfg.get("value-max") if activation_cfg.get("value-max") is not None else ""))
+            self.visual_slider_step_edit.setText(str(activation_cfg.get("value-step") if activation_cfg.get("value-step") is not None else ""))
+            slider_icon_cfg = representation_cfg.get("slider-icon") if isinstance(representation_cfg.get("slider-icon"), dict) else {}
+            self.visual_slider_icon_label_edit.setText(str(slider_icon_cfg.get("label") or ""))
+            self.visual_slider_icon_fill_edit.setText(str(slider_icon_cfg.get("fill-color") or ""))
+            self.visual_slider_icon_track_edit.setText(str(slider_icon_cfg.get("track-color") or ""))
+            self._set_visual_combo_value(self.visual_slider_icon_orientation_combo, str(slider_icon_cfg.get("orientation") or "vertical"))
+            self.visual_slider_icon_min_edit.setText(str(slider_icon_cfg.get("value-min") if slider_icon_cfg.get("value-min") is not None else ""))
+            self.visual_slider_icon_max_edit.setText(str(slider_icon_cfg.get("value-max") if slider_icon_cfg.get("value-max") is not None else ""))
             self.visual_label_edit.setText(str(representation_cfg.get("label") or data.get("label") or ""))
             self.visual_label_size.setValue(int(representation_cfg.get("label-size") or data.get("label-size") or 0))
             self.visual_label_color_edit.setText(str(representation_cfg.get("label-color") or data.get("label-color") or ""))
@@ -3105,6 +3414,22 @@ class EditorTab(QWidget):
                 row["color_edit"].setText(part_colors.get(part_id, ""))
                 row["formula_edit"].setText(part_formulas.get(part_id, ""))
                 self._set_visual_combo_value(row["led_combo"], part_leds.get(part_id, ""))
+
+            # ── Circular-switch sync ──────────────────────────────────────────
+            cs_cfg = representation_cfg.get("circular-switch") if isinstance(representation_cfg.get("circular-switch"), dict) else {}
+            self.visual_cs_angle_start.setValue(int(cs_cfg.get("angle-start") or 280))
+            self.visual_cs_angle_end.setValue(int(cs_cfg.get("angle-end") or 90))
+            cs_ticks = cs_cfg.get("ticks")
+            if isinstance(cs_ticks, list):
+                labels = []
+                for t in cs_ticks:
+                    if isinstance(t, dict):
+                        labels.append(str(t.get("label", "")))
+                    else:
+                        labels.append(str(t))
+                self.visual_cs_ticks.setPlainText("\n".join(labels))
+            else:
+                self.visual_cs_ticks.setPlainText("")
 
             # ── Gauge sync ────────────────────────────────────────────────────
             g = gauge if isinstance(gauge, dict) else {}
@@ -3211,6 +3536,11 @@ class EditorTab(QWidget):
                 cmds.setdefault(pair_fields[0], f"sim/none/{label.lower()}_short")
                 cmds.setdefault(pair_fields[1], f"sim/none/{label.lower()}_long")
                 current_activation["commands"] = cmds
+            elif action_type == "swipe" and pair_fields is not None:
+                cmds = dict(current_activation.get("commands") or {})
+                cmds.setdefault(pair_fields[0], "sim/none/command_up")
+                cmds.setdefault(pair_fields[1], "sim/none/command_down")
+                current_activation["commands"] = cmds
             elif action_type == "page" and not str(current_activation.get("page") or "").strip():
                 current_activation["page"] = "index"
             elif action_type == "page-cycle" and not isinstance(current_activation.get("pages"), list):
@@ -3237,7 +3567,7 @@ class EditorTab(QWidget):
                 cmds["press"] = press_cmd
             else:
                 cmds.pop("press", None)
-        activation_obj = {k: v for k, v in current_activation.items() if k not in {"type", "commands", "page", "pages", "positions"}}
+        activation_obj = {k: v for k, v in current_activation.items() if k not in {"type", "commands", "page", "pages", "positions", "step", "minimum-distance", "set-dataref", "value-min", "value-max", "value-step"}}
         activation_obj["type"] = action_type
         if cmds:
             activation_obj["commands"] = cmds
@@ -3259,6 +3589,31 @@ class EditorTab(QWidget):
             raw_positions = [ln.strip() for ln in self.visual_sweep_positions_edit.toPlainText().splitlines() if ln.strip() and not ln.strip().startswith("#")]
             if raw_positions:
                 activation_obj["positions"] = raw_positions
+        if action_type == "swipe":
+            activation_obj["step"] = self.visual_swipe_step_spin.value()
+            activation_obj["minimum-distance"] = self.visual_swipe_min_distance_spin.value()
+        if action_type == "slider":
+            sd = self.visual_slider_dataref_edit.text().strip()
+            if sd:
+                activation_obj["set-dataref"] = sd
+            smin = self.visual_slider_min_edit.text().strip()
+            if smin:
+                try:
+                    activation_obj["value-min"] = float(smin)
+                except ValueError:
+                    activation_obj["value-min"] = smin
+            smax = self.visual_slider_max_edit.text().strip()
+            if smax:
+                try:
+                    activation_obj["value-max"] = float(smax)
+                except ValueError:
+                    activation_obj["value-max"] = smax
+            sstep = self.visual_slider_step_edit.text().strip()
+            if sstep:
+                try:
+                    activation_obj["value-step"] = float(sstep)
+                except ValueError:
+                    activation_obj["value-step"] = sstep
         data["activation"] = activation_obj
 
         style = str(self.visual_style_combo.currentData() or "standard")
@@ -3273,6 +3628,7 @@ class EditorTab(QWidget):
             "formula",
             "annunciator",
             "gauge",
+            "slider-icon",
             "data",
             "switch",
             "push-switch",
@@ -3284,7 +3640,35 @@ class EditorTab(QWidget):
         representation_obj = {
             key: value for key, value in current_representation.items() if key not in managed_representation_keys
         }
-        if style == "gauge":
+        if style == "slider-icon":
+            representation_obj["type"] = "slider-icon"
+            si = {}
+            lbl = self.visual_slider_icon_label_edit.text().strip()
+            if lbl:
+                si["label"] = lbl
+            fill = self.visual_slider_icon_fill_edit.text().strip()
+            if fill:
+                si["fill-color"] = fill
+            track = self.visual_slider_icon_track_edit.text().strip()
+            if track:
+                si["track-color"] = track
+            orientation = str(self.visual_slider_icon_orientation_combo.currentData() or "vertical")
+            if orientation != "vertical":
+                si["orientation"] = orientation
+            simin = self.visual_slider_icon_min_edit.text().strip()
+            if simin:
+                try:
+                    si["value-min"] = float(simin)
+                except ValueError:
+                    si["value-min"] = simin
+            simax = self.visual_slider_icon_max_edit.text().strip()
+            if simax:
+                try:
+                    si["value-max"] = float(simax)
+                except ValueError:
+                    si["value-max"] = simax
+            representation_obj["slider-icon"] = si
+        elif style == "gauge":
             representation_obj["type"] = "gauge"
             _set_or_del(representation_obj, "label-color", self.visual_label_color_edit.text())
             _set_or_del(representation_obj, "label", self.visual_label_edit.text())
@@ -3450,6 +3834,22 @@ class EditorTab(QWidget):
         else:
             representation_obj.pop("gauge", None)
             representation_obj.pop("formula", None)
+
+        if style == "circular-switch":
+            cs = dict(current_representation.get("circular-switch") or {})
+            # Remove old-schema keys managed by the form; preserve everything else
+            for _k in ("angle-start", "angle-end", "tick-from", "tick-to", "ticks", "tick-labels"):
+                cs.pop(_k, None)
+            cs["angle-start"] = self.visual_cs_angle_start.value()
+            cs["angle-end"] = self.visual_cs_angle_end.value()
+            raw_ticks = self.visual_cs_ticks.toPlainText().strip()
+            if raw_ticks:
+                cs["ticks"] = [line.strip() for line in raw_ticks.splitlines() if line.strip()]
+            else:
+                cs.pop("ticks", None)
+            representation_obj["circular-switch"] = cs
+        else:
+            representation_obj.pop("circular-switch", None)
 
         sc = self.visual_span_cols.value()
         sr = self.visual_span_rows.value()
@@ -3631,6 +4031,10 @@ class EditorTab(QWidget):
         if error:
             self.button_preview_label.setText(error)
             self.button_preview_status.setText("")
+            aircraft = self._current_target_path.name if self._current_target_path else "?"
+            page = self._current_file_path.name if self._current_file_path else "?"
+            deck = self._visual_deck_name or "?"
+            self.log_line.emit(f"[error] preview {aircraft} / {deck} / {page} ({self._button_edit_id or '?'}): {error}")
         else:
             self.button_preview_status.setText("Preview unavailable.")
 
@@ -3830,7 +4234,6 @@ class EditorTab(QWidget):
         hint = "Encoders" if self._is_encoder_page(self._current_file_path) else f"Grid {self._visual_cols}×{self._visual_rows}"
         self.visual_hint.setText(f"{hint}. Drag to move buttons. Drop on an occupied slot to swap.")
         self.zoom_label.setText(f"{int(round(self._visual_zoom * 100))}%")
-        print(f"DEBUG: _rebuild_visual_widgets starting for {self._visual_cols}x{self._visual_rows}")
 
         tile_px = int(128 * self._visual_zoom)
         gap_px = 8
@@ -3879,7 +4282,6 @@ class EditorTab(QWidget):
             for dr in range(sh):
                 for dc in range(sw):
                     covered_cells.add((r0 + dr, c0 + dc))
-            print(f"DEBUG: Spanned Button {button_id} at ({r0},{c0}) -> {sw}x{sh}")
 
         # ── Build QGridLayout ─────────────────────────────────────────────────
         for row in range(self._visual_rows):
@@ -4001,11 +4403,11 @@ class EditorTab(QWidget):
         self._apply_selection_highlights()
         QTimer.singleShot(0, self._queue_visible_previews)
 
-    def _move_button_to_index(self, button_id: str, target_index: int) -> None:
+    def _move_button_to_index(self, button_id: str, target_index: int | str) -> None:
         if button_id not in self._visual_buttons:
             return
         # Multi-drag: if the dragged card is part of a multi-selection, shift all selected
-        if button_id in self._selected_button_ids and len(self._selected_button_ids) > 1:
+        if button_id in self._selected_button_ids and len(self._selected_button_ids) > 1 and isinstance(target_index, int):
             source_index = self._button_index(self._visual_buttons[button_id])
             if source_index is None or source_index == target_index:
                 return
@@ -4032,8 +4434,29 @@ class EditorTab(QWidget):
             # Single button move — swap with occupant if present
             current_button = self._visual_buttons[button_id]
             current_index = current_button.get("index")
+            # Guard: check span doesn't exceed grid boundaries
+            if isinstance(target_index, int) and self._visual_cols > 0:
+                span_raw = current_button.get("span")
+                sw, sh = 1, 1
+                if isinstance(span_raw, (list, tuple)) and len(span_raw) >= 2:
+                    try:
+                        sw, sh = max(1, int(span_raw[0])), max(1, int(span_raw[1]))
+                    except (ValueError, TypeError):
+                        pass
+                elif isinstance(span_raw, str):
+                    try:
+                        parts = span_raw.replace(",", " ").split()
+                        if len(parts) >= 2:
+                            sw, sh = max(1, int(parts[0])), max(1, int(parts[1]))
+                    except (ValueError, TypeError):
+                        pass
+                target_col = target_index % self._visual_cols
+                target_row = target_index // self._visual_cols
+                if target_col + sw > self._visual_cols or target_row + sh > self._visual_rows:
+                    self.status_label.setText("Cannot move: span would extend beyond the grid boundary.")
+                    return
             for other_id, other in self._visual_buttons.items():
-                if other_id != button_id and other.get("index") == target_index:
+                if other_id != button_id and str(other.get("index")) == str(target_index):
                     self._visual_buttons[other_id]["index"] = current_index
                     break
             current_button["index"] = target_index
@@ -4186,7 +4609,7 @@ class EditorTab(QWidget):
                 card.selected.connect(self._set_selected_visual_button)
                 card.edit_requested.connect(self._select_visual_button)
                 card.context_requested.connect(self._show_button_context_menu)
-            # All cards go into _visible_cards so the preview system can queue and refresh them.
+            # All cards go into _visible_cards (preview).
             self._visible_cards[button_id] = card
             return card
 
@@ -4205,12 +4628,17 @@ class EditorTab(QWidget):
 
         # ── Left encoder column (e0, e1, e2) ────────────────────────────────
         for n in range(3):
+            idx = f"e{n}"
+            slot = _GridSlot(idx, dark=self._dark_mode, scale=self._visual_zoom, width=side_w, height=side_h)
+            slot.dropped.connect(self._move_button_to_index)
+            slot.create_requested.connect(lambda _, _idx=idx: self._create_new_button_at_index(_idx))
+            slot.deselect_requested.connect(self._clear_visual_selection)
             if n in enc_by_index:
                 bid, btn, src = enc_by_index[n]
                 card = _make_card(bid, btn, width=side_w, height=side_h, source_file=src)
-                self._ld_enc_left_layout.addWidget(card)
-            else:
-                self._ld_enc_left_layout.addWidget(_make_slot_label(f"e{n}", width=side_w, height=side_h))
+                slot.set_card(card)
+                self._visible_slots[bid] = slot
+            self._ld_enc_left_layout.addWidget(slot)
 
         # ── Center 4×3 grid (buttons 0-11) ──────────────────────────────────
         for row in range(3):
@@ -4218,26 +4646,32 @@ class EditorTab(QWidget):
             for col in range(4):
                 index = row * 4 + col
                 self._ld_center_layout.setColumnMinimumWidth(col, tile_px)
+                slot = _GridSlot(index, dark=self._dark_mode, scale=self._visual_zoom, width=tile_px, height=tile_px)
+                slot.dropped.connect(self._move_button_to_index)
+                slot.create_requested.connect(self._create_new_button_at_index)
+                slot.deselect_requested.connect(self._clear_visual_selection)
                 if index in center_by_index:
                     bid = center_by_index[index]
                     btn = self._visual_buttons[bid]
                     card = _make_card(bid, btn, width=tile_px, height=tile_px)
-                    self._ld_center_layout.addWidget(card, row, col)
-                else:
-                    slot = _GridSlot(index, dark=self._dark_mode, scale=self._visual_zoom)
-                    slot.create_requested.connect(self._create_new_button_at_index)
-                    slot.deselect_requested.connect(self._clear_visual_selection)
-                    self._ld_center_layout.addWidget(slot, row, col)
-                    self._visible_cell_slots[(row, col)] = slot
+                    slot.set_card(card)
+                    self._visible_slots[bid] = slot
+                self._ld_center_layout.addWidget(slot, row, col)
+                self._visible_cell_slots[(row, col)] = slot
 
         # ── Right encoder column (e3, e4, e5) ───────────────────────────────
         for n in range(3, 6):
+            idx = f"e{n}"
+            slot = _GridSlot(idx, dark=self._dark_mode, scale=self._visual_zoom, width=side_w, height=side_h)
+            slot.dropped.connect(self._move_button_to_index)
+            slot.create_requested.connect(lambda _, _idx=idx: self._create_new_button_at_index(_idx))
+            slot.deselect_requested.connect(self._clear_visual_selection)
             if n in enc_by_index:
                 bid, btn, src = enc_by_index[n]
                 card = _make_card(bid, btn, width=side_w, height=side_h, source_file=src)
-                self._ld_enc_right_layout.addWidget(card)
-            else:
-                self._ld_enc_right_layout.addWidget(_make_slot_label(f"e{n}", width=side_w, height=side_h))
+                slot.set_card(card)
+                self._visible_slots[bid] = slot
+            self._ld_enc_right_layout.addWidget(slot)
 
         # ── Physical buttons row (b0-b7) ─────────────────────────────────────
         phys_labels = ["●", "1", "2", "3", "4", "5", "6", "7"]
@@ -4246,10 +4680,13 @@ class EditorTab(QWidget):
                 bid = phys_by_index[n]
                 btn = self._visual_buttons[bid]
                 card = _make_card(bid, btn, width=phys_px, height=phys_px)
+                self._visible_named_cards[bid] = card
                 self._ld_phys_layout.insertWidget(self._ld_phys_layout.count() - 1, card)
             else:
                 lbl = _make_slot_label(phys_labels[n], width=phys_px, height=phys_px, muted=True)
                 self._ld_phys_layout.insertWidget(self._ld_phys_layout.count() - 1, lbl)
+
+        self._apply_selection_highlights()
 
     def _rebuild_loupedeck_encoder_widgets(self) -> None:
         """Build a contextual Loupedeck skeleton for encoder include files."""
@@ -4294,6 +4731,7 @@ class EditorTab(QWidget):
             card.selected.connect(self._set_selected_visual_button)
             card.edit_requested.connect(self._select_visual_button)
             card.context_requested.connect(self._show_button_context_menu)
+            # All cards go into _visible_cards (preview).
             self._visible_cards[button_id] = card
             return card
 
@@ -4311,11 +4749,17 @@ class EditorTab(QWidget):
             return lbl
 
         for n in range(3):
+            idx = f"e{n}"
+            slot = _GridSlot(idx, dark=self._dark_mode, scale=self._visual_zoom, width=side_w, height=side_h)
+            slot.dropped.connect(self._move_button_to_index)
+            slot.create_requested.connect(lambda _, _idx=idx: self._create_new_button_at_index(_idx))
+            slot.deselect_requested.connect(self._clear_visual_selection)
             if n in enc_by_index:
                 bid, btn = enc_by_index[n]
-                self._ld_enc_left_layout.addWidget(_make_card(bid, btn, width=side_w, height=side_h))
-            else:
-                self._ld_enc_left_layout.addWidget(_make_slot_label(f"e{n}", width=side_w, height=side_h))
+                card = _make_card(bid, btn, width=side_w, height=side_h)
+                slot.set_card(card)
+                self._visible_slots[bid] = slot
+            self._ld_enc_left_layout.addWidget(slot)
 
         for row in range(3):
             self._ld_center_layout.setRowMinimumHeight(row, tile_px)
@@ -4324,16 +4768,24 @@ class EditorTab(QWidget):
                 self._ld_center_layout.addWidget(_make_slot_label("", width=tile_px, height=tile_px, muted=True), row, col)
 
         for n in range(3, 6):
+            idx = f"e{n}"
+            slot = _GridSlot(idx, dark=self._dark_mode, scale=self._visual_zoom, width=side_w, height=side_h)
+            slot.dropped.connect(self._move_button_to_index)
+            slot.create_requested.connect(lambda _, _idx=idx: self._create_new_button_at_index(_idx))
+            slot.deselect_requested.connect(self._clear_visual_selection)
             if n in enc_by_index:
                 bid, btn = enc_by_index[n]
-                self._ld_enc_right_layout.addWidget(_make_card(bid, btn, width=side_w, height=side_h))
-            else:
-                self._ld_enc_right_layout.addWidget(_make_slot_label(f"e{n}", width=side_w, height=side_h))
+                card = _make_card(bid, btn, width=side_w, height=side_h)
+                slot.set_card(card)
+                self._visible_slots[bid] = slot
+            self._ld_enc_right_layout.addWidget(slot)
 
         phys_labels = ["●", "1", "2", "3", "4", "5", "6", "7"]
         for n in range(8):
             lbl = _make_slot_label(phys_labels[n], width=phys_px, height=phys_px, muted=True)
             self._ld_phys_layout.insertWidget(self._ld_phys_layout.count() - 1, lbl)
+
+        self._apply_selection_highlights()
 
     def _position_span_cards(self) -> None:
         """DEPRECATED: Now handled by native QGridLayout spanning in _rebuild_visual_widgets."""
@@ -4611,13 +5063,10 @@ class EditorTab(QWidget):
         self.open_in_designer.emit(button_yaml, deck_name, root_path, bid or "", file_path)
 
     def save_button_from_designer(self, button_yaml: str, button_id: str) -> None:
-        """Called by MainWindow when the designer saves a button back to this file."""
+        """Called by MainWindow when the designer applies a button back to this file."""
         if not button_id or not self._current_file_path:
             return
-        ok = self._apply_button_yaml(button_id, button_yaml, silent=False)
-        if ok:
-            self.save_current_file()
-            self.log_line.emit(f"[designer] saved {button_id} to {self._current_file_path.name}")
+        self._apply_button_yaml(button_id, button_yaml, silent=False)
 
     def _open_button_editor_workspace(self, button_id: str, *, initial_text: str | None = None, on_apply=None) -> None:
         self._button_edit_id = button_id
@@ -4694,16 +5143,16 @@ class EditorTab(QWidget):
             self._delete_button(self._button_edit_id)
             self._close_button_editor_workspace()
 
-    def _create_new_button_at_index(self, target_index: int) -> None:
+    def _create_new_button_at_index(self, target_index: int | str) -> None:
         if not self._visual_enabled:
             QMessageBox.information(self, "Visual mode unavailable", "Open a page YAML with buttons first.")
             return
         occupied = {
-            int(button.get("index"))
+            str(button.get("index"))
             for button in self._visual_buttons.values()
-            if isinstance(button.get("index"), int)
+            if button.get("index") is not None
         }
-        if target_index in occupied:
+        if str(target_index) in occupied:
             return
         next_seq = 0
         while f"btn-{next_seq}" in self._visual_buttons:
@@ -4791,10 +5240,7 @@ class EditorTab(QWidget):
             self.editor.document().setModified(mark_modified)
         finally:
             self._loading_file = False
-        if mark_modified:
-            self.modified_label.setText("Unsaved changes")
-        else:
-            self.modified_label.setText("")
+        self._set_dirty_indicator(mark_modified)
         self._effective_page_attrs_cache = {}
 
     def _update_action_state(self) -> None:
@@ -4829,6 +5275,7 @@ class EditorTab(QWidget):
         key = self._preview_key(button_id)
         self._preview_cache.pop(key, None)
         self._preview_errors.pop(key, None)
+        self._preview_key_to_id.pop(key, None)
         self._preview_inflight.discard(key)
         self._preview_queue_keys.discard(key)
         self._preview_queue = [item for item in self._preview_queue if item[0] != key]
@@ -4844,6 +5291,7 @@ class EditorTab(QWidget):
         button_yaml = yaml.safe_dump(self._button_preview_config(button_id), sort_keys=False, allow_unicode=False)
         deck_name = self._visual_deck_name
         generation = self._preview_generation
+        self._preview_key_to_id[key] = button_id
         self._preview_queue.append((key, deck_name, button_yaml, generation))
         self._preview_queue_keys.add(key)
         self._pump_preview_queue()
@@ -4872,6 +5320,13 @@ class EditorTab(QWidget):
 
             threading.Thread(target=_worker, daemon=True).start()
 
+    def _preview_error_message(self, key: str, error: str) -> str:
+        button_id = self._preview_key_to_id.get(key, "?")
+        aircraft = self._current_target_path.name if self._current_target_path else "?"
+        page = self._current_file_path.name if self._current_file_path else "?"
+        deck = self._visual_deck_name or "?"
+        return f"[error] preview {aircraft} / {deck} / {page} ({button_id}): {error}"
+
     def _on_preview_ready(self, key: str, image_bytes: object, info: object) -> None:
         self._preview_inflight.discard(key)
         payload = info if isinstance(info, dict) else {}
@@ -4886,10 +5341,13 @@ class EditorTab(QWidget):
                 self._preview_errors.pop(key, None)
             else:
                 self._preview_errors[key] = "preview decode failed"
+                self.log_line.emit(self._preview_error_message(key, "preview decode failed"))
         elif error:
-                self._preview_errors[key] = error
+            self._preview_errors[key] = error
+            self.log_line.emit(self._preview_error_message(key, error))
         else:
             self._preview_errors[key] = "preview unavailable"
+            self.log_line.emit(self._preview_error_message(key, "preview unavailable"))
         self._pump_preview_queue()
         if self._visual_enabled and self.stack.currentWidget() is self.visual_scroll:
             self._preview_refresh_timer.start(75)
