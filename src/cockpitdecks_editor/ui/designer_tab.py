@@ -59,8 +59,7 @@ def _extract_datarefs_from_button(data: dict) -> list[str]:
                 _scan(item)
 
     _scan(data)
-    seen: set[str] = set()
-    return [x for x in found if not (x in seen or seen.add(x))]  # type: ignore[func-returns-value]
+    return list(dict.fromkeys(found))
 
 
 def _validate_button_config(data: dict, target_root: Any, deck_name: str) -> str | None:
@@ -382,10 +381,10 @@ class DesignerTab(QWidget):
         btn_clear.clicked.connect(self._clear)
         bottom.addWidget(btn_clear)
         bottom.addStretch(1)
-        self.btn_save_to_page = QPushButton("Save and Close")
+        self.btn_save_to_page = QPushButton("Done")
         self.btn_save_to_page.setFixedHeight(32)
         self.btn_save_to_page.setEnabled(False)
-        self.btn_save_to_page.setToolTip("Write this button back to the page file it was opened from and return to the Editor tab")
+        self.btn_save_to_page.setToolTip("Apply this button back to the page and return to the Editor tab (file not saved yet)")
         self.btn_save_to_page.clicked.connect(self._save_to_page)
         bottom.addWidget(self.btn_save_to_page)
         root.addLayout(bottom)
@@ -434,7 +433,7 @@ class DesignerTab(QWidget):
         has_source = bool(button_id and file_path)
         self.btn_save_to_page.setEnabled(False)  # no changes yet
         self.btn_save_to_page.setToolTip(
-            f"Save back to {Path(file_path).name} ({button_id}) and return to the Editor tab" if has_source
+            f"Apply back to {Path(file_path).name} ({button_id}) and return to the Editor tab (file not saved yet)" if has_source
             else "No source page — use Copy YAML instead"
         )
         try:
@@ -444,7 +443,6 @@ class DesignerTab(QWidget):
         if not isinstance(data, dict):
             data = {}
         self._loaded_yaml_str = yaml.safe_dump(data, sort_keys=False, allow_unicode=False)
-        self.button_form.clear_stash()
         self._loading = True
         try:
             self.yaml_edit.setPlainText(self._loaded_yaml_str)
@@ -461,7 +459,7 @@ class DesignerTab(QWidget):
         if not text or not self._source_button_id or not self._source_file_path:
             return
         self.save_to_page.emit(text, self._source_button_id, self._source_file_path)
-        self.log_line.emit(f"Saved {self._source_button_id} to {Path(self._source_file_path).name}")
+        self.log_line.emit(f"Applied {self._source_button_id} to {Path(self._source_file_path).name} (unsaved)")
         # Reset dirty baseline so button disables until the next edit
         try:
             data = yaml.safe_load(text)

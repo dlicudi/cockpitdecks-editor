@@ -87,6 +87,7 @@ def get_representation_schema_map() -> dict[str, dict[str, Any]]:
         "gauge",
         "knob",
         "push-switch",
+        "slider-icon",
         "switch",
         "tape",
         "weather-metar",
@@ -452,6 +453,8 @@ def render_button_preview_native(
                     msg = f"{msg}\n\n{log_detail}"
                 return None, None, msg
             target_size = deck.get_spanned_image_size(button) or deck.get_image_size(button.index)
+            if target_size and not all(d > 0 for d in target_size):
+                return None, None, "span extends beyond deck boundary"
             if target_size and getattr(image, "size", None) != target_size:
                 image = image.resize(target_size, resample=Image.Resampling.LANCZOS)
             # For side-display encoder previews, crop the full strip to the relevant 1/3 slot.

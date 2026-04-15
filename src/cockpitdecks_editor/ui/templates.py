@@ -241,6 +241,52 @@ TEMPLATES = {
             },
         },
     },
+    "Sliders": {
+        "Throttle Slider (web deck)": {
+            "index": 0,
+            "name": "throttle_slider",
+            "span": [1, 3],
+            "activation": {
+                "type": "slider",
+                "set-dataref": "sim/flightmodel/engine/ENGN_thro[0]",
+                "value-min": 0,
+                "value-max": 1,
+            },
+            "representation": {
+                "type": "slider-icon",
+                "slider-icon": {
+                    "dataref": "sim/flightmodel/engine/ENGN_thro[0]",
+                    "value-min": 0,
+                    "value-max": 1,
+                    "label": "POWER",
+                    "fill-color": "cyan",
+                    "orientation": "vertical",
+                },
+            },
+        },
+        "Mixture Slider (web deck)": {
+            "index": 1,
+            "name": "mixture_slider",
+            "span": [1, 3],
+            "activation": {
+                "type": "slider",
+                "set-dataref": "sim/flightmodel/engine/ENGN_mixt[0]",
+                "value-min": 0,
+                "value-max": 1,
+            },
+            "representation": {
+                "type": "slider-icon",
+                "slider-icon": {
+                    "dataref": "sim/flightmodel/engine/ENGN_mixt[0]",
+                    "value-min": 0,
+                    "value-max": 1,
+                    "label": "MIXTURE",
+                    "fill-color": "#ff8c00",
+                    "orientation": "vertical",
+                },
+            },
+        },
+    },
     "Gauges": {
         "Tachometer (0–2700 RPM)": {
             "index": 0,

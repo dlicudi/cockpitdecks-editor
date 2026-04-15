@@ -18,6 +18,7 @@ from cockpitdecks_editor.ui.app_style import MAIN_WINDOW_QSS
 from cockpitdecks_editor.ui.dataref_tab import DatarefTab
 from cockpitdecks_editor.ui.designer_tab import DesignerTab
 from cockpitdecks_editor.ui.editor_tab import EditorTab
+from cockpitdecks_editor.ui.logs_tab import LogsTab
 
 
 class MainWindow(QMainWindow):
@@ -50,8 +51,12 @@ class MainWindow(QMainWindow):
         root.addWidget(header)
 
         self.tabs = QTabWidget()
+
+        self.logs_tab = LogsTab()
+
         self.editor_tab = EditorTab()
         self.editor_tab.log_line.connect(self._append_status)
+        self.editor_tab.log_line.connect(self.logs_tab.append_line)
         self.editor_tab.root_path_changed.connect(self._sync_root_summary)
         self.editor_tab.root_path_changed.connect(self._on_root_changed)
         self.editor_tab.open_in_designer.connect(self._open_button_in_designer)
@@ -59,12 +64,16 @@ class MainWindow(QMainWindow):
 
         self.designer_tab = DesignerTab()
         self.designer_tab.log_line.connect(self._append_status)
+        self.designer_tab.log_line.connect(self.logs_tab.append_line)
         self.designer_tab.save_to_page.connect(self._save_button_to_page)
         self.tabs.addTab(self.designer_tab, "Button Designer")
 
         self.dataref_tab = DatarefTab()
         self.dataref_tab.log_line.connect(self._append_status)
+        self.dataref_tab.log_line.connect(self.logs_tab.append_line)
         self.tabs.addTab(self.dataref_tab, "Dataref Navigator")
+
+        self.tabs.addTab(self.logs_tab, "Logs")
 
         root.addWidget(self.tabs, 1)
 
