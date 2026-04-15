@@ -255,6 +255,7 @@ class _NativePreviewContext:
         self.cockpit.aircraft._config = Config(str(target_root / "deckconfig" / "config.yaml"))
         self.cockpit.aircraft.load_deck_types()
         self.cockpit.aircraft.load_resources()
+        self.cockpit.load_fonts()  # merges cockpitdecks bundled fonts + aircraft fonts into cockpit.fonts
         self._config_data = yaml.safe_load((target_root / "deckconfig" / "config.yaml").read_text(encoding="utf-8")) or {}
         self._decks: dict[str, _PreviewDeck] = {}
 

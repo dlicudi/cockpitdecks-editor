@@ -409,9 +409,7 @@ class DesignerTab(QWidget):
         self._set_preview_deck_name(deck_name)
         if self._target_root:
             from cockpitdecks_editor.services.native_preview import list_preview_fonts
-            fonts = list_preview_fonts(self._target_root)
-            if fonts:
-                self.button_form.populate_fonts(fonts)
+            self.button_form.populate_fonts(list_preview_fonts(self._target_root))
         self._schedule_preview()
 
     def load_button(
@@ -449,6 +447,7 @@ class DesignerTab(QWidget):
             self.button_form.load(data)
         finally:
             self._loading = False
+        self.button_form.populate_fonts(self.button_form._available_fonts)
         self._autofill_fake_datarefs(data)
         if file_path:
             self._auto_load_defaults(file_path=file_path)
