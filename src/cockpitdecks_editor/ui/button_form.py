@@ -589,6 +589,7 @@ class ButtonFormWidget(QWidget):
         self._rep_form.addRow(self._dynamic_rep_container)
         self._dynamic_rep_row = self._dynamic_rep_container
         self._dynamic_rep_widgets: dict[str, QWidget] = {}
+        self._available_fonts: list[str] = []
 
         rep_layout.addLayout(self._rep_form)
         root.addWidget(rep_frame)
@@ -629,6 +630,18 @@ class ButtonFormWidget(QWidget):
 
     def _create_dynamic_rep_widget(self, field: dict, value: Any) -> QWidget:
         field_type = str(field.get("type") or "string")
+        if field_type == "font":
+            combo = _NoWheelComboBox()
+            combo.setEditable(True)
+            combo.addItem("(default)", "")
+            combo.lineEdit().setPlaceholderText("font name")
+            for name in self._available_fonts:
+                combo.addItem(name, name)
+            if value not in (None, ""):
+                _set_combo(combo, str(value))
+            combo.currentIndexChanged.connect(self._on_form_changed)
+            combo.lineEdit().textEdited.connect(self._on_form_changed)
+            return combo
         if field_type == "boolean":
             widget = QCheckBox()
             widget.setChecked(bool(value))
@@ -849,7 +862,7 @@ class ButtonFormWidget(QWidget):
         field_type = str(field.get("type") or "string")
         if field_type == "boolean":
             return True if widget.isChecked() else None
-        if field_type == "choice":
+        if field_type in {"choice", "font"}:
             text = widget.currentText().strip()
             return text or None
         if field_type in {"sub", "selector"} or (field_type == "list" and field.get("item_fields")):
@@ -952,6 +965,22 @@ class ButtonFormWidget(QWidget):
 
     def populate_fonts(self, font_names: list[str]) -> None:
         """Reload font combos with available font names (call after target is set)."""
+        self._available_fonts = list(font_names)
+        # Refresh font-type fields in the dynamic representation form
+        for widget in self._dynamic_rep_widgets.values():
+            if isinstance(widget, QComboBox):
+                # Only refresh combos that were created as font pickers
+                # (identified by having a "(default)" placeholder item)
+                if widget.count() > 0 and widget.itemText(0) == "(default)":
+                    current = widget.currentText().strip()
+                    widget.blockSignals(True)
+                    widget.clear()
+                    widget.addItem("(default)", "")
+                    for name in font_names:
+                        widget.addItem(name, name)
+                    _set_combo(widget, current)
+                    widget.blockSignals(False)
+        # Refresh annunciator parts font combos
         parts_widget = self._dynamic_rep_widgets.get("parts")
         if isinstance(parts_widget, AnnunciatorPartsWidget):
             parts_widget.populate_fonts(font_names)
