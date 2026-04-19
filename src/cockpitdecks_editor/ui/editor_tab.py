@@ -145,6 +145,7 @@ class _NoWheelSpinBox(QSpinBox):
 _ACTIVATION_SCHEMA: dict[str, list[tuple[str, str]]] = {
     "Push Button": [
         ("push", "Momentary Command"),
+        ("push-value", "Push Value"),
         ("begin-end-command", "Begin / End Command"),
         ("short-or-long-press", "Short / Long Press"),
         ("sweep", "Sweep (Multi-position)"),
@@ -319,6 +320,8 @@ class _VisualButtonCard(QFrame):
         scale: float = 1.0,
         preview: QPixmap | None = None,
         preview_status: str | None = None,
+        included: bool = False,
+        included_source: str | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -327,6 +330,8 @@ class _VisualButtonCard(QFrame):
         self._drag_start: QPoint | None = None
         self._dragging = False
         self._dark = dark
+        self._included = included
+        self._included_source = included_source
         self._scale = max(0.6, min(2.0, scale))
         self._size = int(118 * self._scale)
         self._render_width = self._size
@@ -496,6 +501,16 @@ class _VisualButtonCard(QFrame):
                     self._layout.addWidget(status_label)
                 else:
                     self._layout.addStretch(1)
+                if getattr(self, "_included", False) and getattr(self, "_included_source", None):
+                    src_label = QLabel(self._included_source)
+                    src_label.setWordWrap(False)
+                    if self._dark:
+                        src_color = "#38bdf8"
+                    else:
+                        src_color = "#0ea5e9"
+                    src_label.setStyleSheet(f"font-size: {max(7, int(8 * self._scale))}px; color: {src_color};")
+                    src_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+                    self._layout.addWidget(src_label)
                 self._layout.addStretch(1)
         except (RuntimeError, AttributeError):
             pass
@@ -529,6 +544,7 @@ class _VisualButtonCard(QFrame):
             return
         selected = getattr(self, "_selected", False)
         has_preview = hasattr(self, "_last_pixmap") and self._last_pixmap is not None and not self._last_pixmap.isNull()
+        included = getattr(self, "_included", False)
         pad = 2 if selected and not has_preview else 0
         if hasattr(self, "_layout") and self._layout is not None:
             try:
@@ -541,22 +557,24 @@ class _VisualButtonCard(QFrame):
             self._fg_secondary = "#94a3b8"
             sel_border = "#fb923c"
             sel_bg = "rgba(251, 146, 60, 0.18)"
+            inc_border = "#38bdf8"
+            inc_bg = "rgba(56, 189, 248, 0.08)"
         else:
             self._fg_primary = "#0f172a"
             self._fg_secondary = "#64748b"
             sel_border = "#f97316"
             sel_bg = "rgba(249, 115, 22, 0.10)"
+            inc_border = "#0ea5e9"
+            inc_bg = "rgba(14, 165, 233, 0.07)"
+        try:
+            self.setGraphicsEffect(None)
+        except RuntimeError:
+            pass
         if selected and not has_preview:
-            try:
-                self.setGraphicsEffect(None)
-            except RuntimeError:
-                pass
             self.setStyleSheet(f"QFrame {{ background: {sel_bg}; border: 2px solid {sel_border}; border-radius: 8px; }}")
+        elif included:
+            self.setStyleSheet(f"QFrame {{ background: {inc_bg}; border: 1px dashed {inc_border}; border-radius: 8px; }}")
         else:
-            try:
-                self.setGraphicsEffect(None)
-            except RuntimeError:
-                pass
             self.setStyleSheet("QFrame { background: transparent; border: none; }")
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
@@ -567,6 +585,8 @@ class _VisualButtonCard(QFrame):
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         if self._drag_start is None:
+            return
+        if getattr(self, "_included", False):
             return
         if (event.pos() - self._drag_start).manhattanLength() < QApplication.startDragDistance():
             super().mouseMoveEvent(event)
@@ -2757,10 +2777,12 @@ class EditorTab(QWidget):
         self._loupedeck_live_mode = deck_type == "LoupedeckLive" and not is_encoder_file
         self._loupedeck_encoder_mode = deck_type == "LoupedeckLive" and is_encoder_file
         self._included_buttons = {}
+        layout_dir = self._resolve_layout_dir(self._current_file_path)
         if self._loupedeck_live_mode:
-            layout_dir = self._resolve_layout_dir(self._current_file_path)
             if layout_dir is not None:
                 self._included_buttons = self._load_encoder_includes(data, layout_dir)
+        elif layout_dir is not None:
+            self._included_buttons = self._load_page_includes(data, layout_dir)
 
         self._visual_cols, self._visual_rows = self._infer_grid_dimensions(self._current_file_path, buttons)
         self._visual_enabled = True
@@ -2874,6 +2896,36 @@ class EditorTab(QWidget):
                 continue
             if "encoders" not in inc_path.parts:
                 continue  # skip non-encoder includes (e.g. pager)
+            try:
+                inc_data = yaml.safe_load(inc_path.read_text(encoding="utf-8")) or {}
+            except Exception:
+                continue
+            if not isinstance(inc_data, dict):
+                continue
+            for idx, btn in enumerate(inc_data.get("buttons") or []):
+                if not isinstance(btn, dict):
+                    continue
+                button_id = f"inc-{name.replace('/', '-')}-{idx}"
+                result[button_id] = (btn, inc_path)
+        return result
+
+    def _load_page_includes(self, page_data: dict, layout_dir: Path) -> dict[str, tuple[dict, Path]]:
+        """Load buttons from page-level includes (e.g. a shared pager sidebar).
+
+        Returns a dict mapping button_id → (button_dict, source_path).
+        """
+        result: dict[str, tuple[dict, Path]] = {}
+        raw_includes = page_data.get("includes")
+        if isinstance(raw_includes, str):
+            include_names = [p.strip() for p in raw_includes.split(",") if p.strip()]
+        elif isinstance(raw_includes, list):
+            include_names = [str(p).strip() for p in raw_includes if str(p).strip()]
+        else:
+            return result
+        for name in include_names:
+            inc_path = layout_dir / f"{name}.yaml"
+            if not inc_path.is_file():
+                continue
             try:
                 inc_data = yaml.safe_load(inc_path.read_text(encoding="utf-8")) or {}
             except Exception:
@@ -4081,6 +4133,11 @@ class EditorTab(QWidget):
                 continue
             if start_index <= index < end_index:
                 self._ensure_button_preview(button_id)
+        for button_id, (btn, _src) in self._included_buttons.items():
+            index = self._button_index(btn)
+            if index is not None and start_index <= index < end_index:
+                if button_id in self._visible_cards:
+                    self._ensure_button_preview(button_id)
 
     def _infer_grid_dimensions(self, page_path: Path, buttons: list[dict]) -> tuple[int, int]:
         # Encoder pages use eN indexes (mapped to ints 0..N-1) — show as a single row.
@@ -4252,6 +4309,13 @@ class EditorTab(QWidget):
             if (index := self._button_index(button)) is not None
         }
 
+        # Included buttons by grid index — only shown where no local button exists
+        included_by_index: dict[int, tuple[str, dict, Path]] = {}
+        for _inc_id, (_inc_btn, _inc_path) in self._included_buttons.items():
+            _inc_index = self._button_index(_inc_btn)
+            if _inc_index is not None and _inc_index not in by_index:
+                included_by_index[_inc_index] = (_inc_id, _inc_btn, _inc_path)
+
         # ── Compute span origins and covered cells ────────────────────────────
         span_origins: dict[tuple[int, int], tuple[int, int, str]] = {}  # (r,c) → (sw, sh, btn_id)
         covered_cells: set[tuple[int, int]] = set()
@@ -4348,6 +4412,32 @@ class EditorTab(QWidget):
                     self._visible_slots[button_id] = slot
                     if button_id in self._selected_button_ids:
                         card.set_selected(True)
+
+                # ── Handle Included Buttons (from include files) ───────────────
+                elif slot_index in included_by_index:
+                    inc_button_id, inc_button, inc_source = included_by_index[slot_index]
+                    card = _VisualButtonCard(
+                        inc_button_id,
+                        inc_button,
+                        dark=self._dark_mode,
+                        scale=self._visual_zoom,
+                        preview=self._preview_cache.get(self._preview_key(inc_button_id)),
+                        preview_status=self._preview_errors.get(self._preview_key(inc_button_id)),
+                        included=True,
+                        included_source=inc_source.stem,
+                    )
+                    card.setToolTip(f"From: {inc_source.name}\nClick to open and edit in that file.")
+
+                    def _open_inc_file(checked=False, _sf=inc_source):
+                        if not self._confirm_discard_changes():
+                            return
+                        self._load_file(_sf)
+
+                    card.selected.connect(lambda bid, _open=_open_inc_file: _open())
+                    card.edit_requested.connect(_open_inc_file)
+                    card.context_requested.connect(lambda bid, pos: None)
+                    slot.set_card(card)
+                    self._visible_cards[inc_button_id] = card
                 
                 # Only add slot if not covered by a spanned card
                 if (row, col) not in covered_cells:

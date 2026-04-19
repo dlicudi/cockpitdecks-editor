@@ -259,6 +259,9 @@ class AnnunciatorPartsWidget(QWidget):
                 led_combo.addItem(label, val)
             fl.addRow("LED", led_combo)
 
+            framed_check = QCheckBox()
+            fl.addRow("Framed", framed_check)
+
             outer.addWidget(frame)
             row = {
                 "text_edit": text_edit,
@@ -268,6 +271,7 @@ class AnnunciatorPartsWidget(QWidget):
                 "size_spin": size_spin,
                 "color_edit": color_edit,
                 "led_combo": led_combo,
+                "framed_check": framed_check,
             }
             self._rows.append(row)
 
@@ -276,6 +280,7 @@ class AnnunciatorPartsWidget(QWidget):
             font_combo.currentTextChanged.connect(self._emit)
             size_spin.valueChanged.connect(self._emit)
             led_combo.currentIndexChanged.connect(self._emit)
+            framed_check.stateChanged.connect(self._emit)
 
     def _emit(self) -> None:
         if not self._loading:
@@ -307,6 +312,7 @@ class AnnunciatorPartsWidget(QWidget):
                 row["size_spin"].setValue(int(part.get("text-size") or 0))
                 row["color_edit"].setText(str(part.get("color") or ""))
                 _set_combo(row["led_combo"], str(part.get("led") or ""))
+                row["framed_check"].setChecked(bool(part.get("framed", False)))
         finally:
             self._loading = False
 
@@ -321,6 +327,7 @@ class AnnunciatorPartsWidget(QWidget):
             size = row["size_spin"].value()
             color = row["color_edit"].text().strip()
             led = str(row["led_combo"].currentData() or "").strip()
+            framed = row["framed_check"].isChecked()
             if text:
                 part["text"] = text
             if formula:
@@ -335,6 +342,8 @@ class AnnunciatorPartsWidget(QWidget):
                 part["color"] = color
             if led:
                 part["led"] = led
+            if framed:
+                part["framed"] = True
             if part:
                 result.append(part)
         return result or None
@@ -528,8 +537,8 @@ class ButtonFormWidget(QWidget):
 
         # Slider-specific fields
         self.slider_dataref_edit = QLineEdit()
-        self.slider_dataref_edit.setPlaceholderText("sim/flightmodel/engine/ENGN_thro[0]")
-        self.slider_dataref_edit.setToolTip("Dataref to write when slider position changes")
+        self.slider_dataref_edit.setPlaceholderText("sim/...")
+        self.slider_dataref_edit.setToolTip("Dataref to write when this activation fires")
         self._slider_dataref_row = self.slider_dataref_edit
         self._act_form.addRow("Set Dataref", self._slider_dataref_row)
 
@@ -958,7 +967,8 @@ class ButtonFormWidget(QWidget):
             self.slider_dataref_edit.setText(str(activation_cfg.get("set-dataref") or ""))
             self.slider_min_edit.setText(str(activation_cfg.get("value-min") if activation_cfg.get("value-min") is not None else "0"))
             self.slider_max_edit.setText(str(activation_cfg.get("value-max") if activation_cfg.get("value-max") is not None else "1"))
-            self.slider_step_edit.setText(str(activation_cfg.get("value-step") or ""))
+            step_val = activation_cfg.get("step") if action_type == "push-value" else activation_cfg.get("value-step")
+            self.slider_step_edit.setText(str(step_val or ""))
         finally:
             self._syncing = False
         self._update_visibility()
@@ -1056,7 +1066,7 @@ class ButtonFormWidget(QWidget):
         
         is_page = action_type in {"page", "page-cycle"}
         is_page_cycle = action_type == "page-cycle"
-        is_command_like = action_type not in {"none", "page", "page-cycle", "swipe", "encoder", "encoder-push", "encoder-mode", "encoder-toggle", "encoder-value", "encoder-value-extended"}
+        is_command_like = action_type not in {"none", "page", "page-cycle", "swipe", "push-value", "encoder", "encoder-push", "encoder-mode", "encoder-toggle", "encoder-value", "encoder-value-extended"}
         is_two_command = action_type in {"encoder-toggle", "short-or-long-press", "swipe"}
         is_swipe = action_type == "swipe"
         is_encoder = action_type in {"encoder", "encoder-push", "encoder-mode", "encoder-toggle", "encoder-value", "encoder-value-extended"}
@@ -1078,10 +1088,18 @@ class ButtonFormWidget(QWidget):
         _set_form_row_visible(self._act_form, self._sweep_positions_row, is_sweep)
         _set_form_row_visible(self._act_form, self._swipe_step_row, is_swipe)
         _set_form_row_visible(self._act_form, self._swipe_min_distance_row, is_swipe)
-        _set_form_row_visible(self._act_form, self._slider_dataref_row, is_slider)
-        _set_form_row_visible(self._act_form, self._slider_min_row, is_slider)
-        _set_form_row_visible(self._act_form, self._slider_max_row, is_slider)
-        _set_form_row_visible(self._act_form, self._slider_step_row, is_slider)
+        is_push_value = action_type == "push-value"
+        _set_form_row_visible(self._act_form, self._slider_dataref_row, is_slider or is_push_value)
+        _set_form_row_visible(self._act_form, self._slider_min_row, is_slider or is_push_value)
+        _set_form_row_visible(self._act_form, self._slider_max_row, is_slider or is_push_value)
+        _set_form_row_visible(self._act_form, self._slider_step_row, is_slider or is_push_value)
+
+        if is_push_value:
+            self.slider_step_edit.setPlaceholderText("1")
+            self.slider_max_edit.setPlaceholderText("1")
+        elif is_slider:
+            self.slider_step_edit.setPlaceholderText("0 (continuous)")
+            self.slider_max_edit.setPlaceholderText("1")
 
         if action_type == "encoder-toggle":
             self.command1_label.setText("On")
@@ -1166,7 +1184,7 @@ class ButtonFormWidget(QWidget):
         if action_type == "swipe":
             activation_obj["step"] = self.swipe_step_spin.value()
             activation_obj["minimum-distance"] = self.swipe_min_distance_spin.value()
-        if action_type == "slider":
+        if action_type in {"slider", "push-value"}:
             dr = self.slider_dataref_edit.text().strip()
             if dr:
                 activation_obj["set-dataref"] = dr
@@ -1178,9 +1196,10 @@ class ButtonFormWidget(QWidget):
                     except ValueError:
                         activation_obj[key] = raw
             step_raw = self.slider_step_edit.text().strip()
+            step_key = "step" if action_type == "push-value" else "value-step"
             if step_raw:
                 try:
-                    activation_obj["value-step"] = float(step_raw)
+                    activation_obj[step_key] = float(step_raw)
                 except ValueError:
                     pass
 
