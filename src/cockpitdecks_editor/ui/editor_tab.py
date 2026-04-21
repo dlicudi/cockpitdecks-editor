@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
@@ -52,6 +53,440 @@ except ImportError:
 from cockpitdecks_editor.services.live_apis import render_button_preview
 from cockpitdecks_editor.services.native_preview import describe_slot_native, list_preview_fonts, render_button_preview_native, warm_preview_pool, _side_display_slot_config
 from cockpitdecks_editor.services.desktop_settings import load as load_settings, save as save_settings
+
+
+@dataclass
+class _DeckNodeModel:
+    deck_name: str
+    deck_type: str
+    layout_id: str
+    layout_dir: Path
+    layout_config: Path | None  # None if deckconfig/<layout>/config.yaml is missing
+    brightness: int = 0
+    pages: list[Path] = field(default_factory=list)
+    includes: list[Path] = field(default_factory=list)
+    missing: bool = False  # True if the declared layout dir does not exist
+
+
+@dataclass
+class _DeckTreeModel:
+    target_root: Path
+    deckconfig_dir: Path
+    top_config: Path | None  # deckconfig/config.yaml, or None if missing
+    aircraft_name: str = ""
+    decks: list[_DeckNodeModel] = field(default_factory=list)
+    shared_files: list[Path] = field(default_factory=list)
+
+
+def _parse_decks_from_top_config(top_config: Path) -> tuple[str, list[tuple[str, str, str, int]]]:
+    """Return (aircraft_name, [(name, type, layout, brightness), ...]) from the top-level config."""
+    try:
+        data = yaml.safe_load(top_config.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return "", []
+    aircraft = str(data.get("aircraft") or "").strip()
+    result: list[tuple[str, str, str, int]] = []
+    for deck in (data.get("decks") or []):
+        if not isinstance(deck, dict):
+            continue
+        name = str(deck.get("name") or "").strip()
+        dtype = str(deck.get("type") or "").strip()
+        layout = str(deck.get("layout") or "").strip()
+        brightness = int(deck.get("brightness") or 0)
+        if not layout:
+            continue
+        result.append((name or layout, dtype, layout, brightness))
+    return aircraft, result
+
+
+def _collect_layout_files(layout_dir: Path) -> tuple[list[Path], list[Path]]:
+    """Split a layout folder's yaml files into (pages, includes).
+
+    Pages are top-level *.yaml (excluding config.yaml).
+    Includes are yaml files in an ``includes/`` or ``encoders/`` subfolder.
+    """
+    pages: list[Path] = []
+    includes: list[Path] = []
+    if not layout_dir.is_dir():
+        return pages, includes
+    for path in sorted(layout_dir.iterdir()):
+        if path.is_file() and path.suffix.lower() in {".yaml", ".yml"} and path.name != "config.yaml":
+            pages.append(path)
+    for sub_name in ("includes", "encoders"):
+        sub = layout_dir / sub_name
+        if sub.is_dir():
+            for path in sorted(sub.rglob("*")):
+                if path.is_file() and path.suffix.lower() in {".yaml", ".yml"}:
+                    includes.append(path)
+    return pages, includes
+
+
+def _build_deck_tree_model(target_root: Path) -> _DeckTreeModel | None:
+    """Build the grouped tree model for a given project root.
+
+    Returns None if the folder is not a Cockpitdecks project (no ``deckconfig/``).
+    """
+    deckconfig = target_root / "deckconfig"
+    if not deckconfig.is_dir():
+        return None
+    top_config = deckconfig / "config.yaml"
+    model = _DeckTreeModel(
+        target_root=target_root,
+        deckconfig_dir=deckconfig,
+        top_config=top_config if top_config.is_file() else None,
+    )
+
+    claimed_dirs: set[Path] = set()
+    if model.top_config is not None:
+        aircraft, deck_tuples = _parse_decks_from_top_config(model.top_config)
+        model.aircraft_name = aircraft
+        for name, dtype, layout, brightness in deck_tuples:
+            layout_dir = deckconfig / layout
+            layout_config = layout_dir / "config.yaml"
+            pages, includes = _collect_layout_files(layout_dir)
+            missing = not layout_dir.is_dir()
+            model.decks.append(
+                _DeckNodeModel(
+                    deck_name=name,
+                    deck_type=dtype,
+                    layout_id=layout,
+                    layout_dir=layout_dir,
+                    layout_config=layout_config if layout_config.is_file() else None,
+                    brightness=brightness,
+                    pages=pages,
+                    includes=includes,
+                    missing=missing,
+                )
+            )
+            if not missing:
+                claimed_dirs.add(layout_dir.resolve())
+
+    allowed_suffixes = {".yaml", ".yml", ".json", ".txt", ".j2", ".css", ".js"}
+    for path in sorted(target_root.rglob("*")):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in allowed_suffixes:
+            continue
+        try:
+            rel = path.relative_to(target_root)
+        except ValueError:
+            continue
+        if any(part.startswith(".") for part in rel.parts):
+            continue
+        if path == model.top_config:
+            continue
+        parent_claimed = False
+        cursor = path.parent
+        while True:
+            try:
+                resolved = cursor.resolve()
+            except OSError:
+                break
+            if resolved in claimed_dirs:
+                parent_claimed = True
+                break
+            if cursor == target_root or cursor.parent == cursor:
+                break
+            cursor = cursor.parent
+        if parent_claimed:
+            continue
+        model.shared_files.append(path)
+
+    return model
+
+
+def _parse_color(text: str) -> QColor | None:
+    t = text.strip()
+    if not t:
+        return None
+    if t.startswith("#"):
+        c = QColor(t)
+        return c if c.isValid() else None
+    m = re.match(r"^\(?(\d+),\s*(\d+),\s*(\d+)\)?$", t)
+    if m:
+        return QColor(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    c = QColor(t)
+    return c if c.isValid() else None
+
+
+class _ColorField(QWidget):
+    """Line edit + color swatch button. Clicking the swatch opens QColorDialog."""
+
+    textChanged = Signal(str)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(4)
+        self._edit = QLineEdit()
+        self._edit.textChanged.connect(self._on_text_changed)
+        row.addWidget(self._edit, 1)
+        self._swatch = QPushButton()
+        self._swatch.setFixedSize(28, 28)
+        self._swatch.setObjectName("colorSwatch")
+        self._swatch.clicked.connect(self._pick_color)
+        row.addWidget(self._swatch)
+        self._update_swatch("")
+
+    def _on_text_changed(self, text: str) -> None:
+        self._update_swatch(text)
+        self.textChanged.emit(text)
+
+    def _update_swatch(self, text: str) -> None:
+        c = _parse_color(text)
+        if c and c.isValid():
+            self._swatch.setStyleSheet(
+                f"QPushButton {{ background: {c.name()}; border: 1px solid #cbd5e1; border-radius: 4px; }}"
+            )
+        else:
+            self._swatch.setStyleSheet(
+                "QPushButton { background: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 4px; }"
+            )
+
+    def _pick_color(self) -> None:
+        from PySide6.QtWidgets import QColorDialog
+        initial = _parse_color(self._edit.text()) or QColor("#ffffff")
+        color = QColorDialog.getColor(initial, self, "Pick Color")
+        if color.isValid():
+            self._edit.setText(color.name())
+
+    def text(self) -> str:
+        return self._edit.text()
+
+    def setText(self, value: str) -> None:
+        self._edit.setText(value)
+
+
+def _field_with_hint(widget: QWidget, hint: str) -> QWidget:
+    """Wrap a form field with a small italic hint label underneath."""
+    host = QWidget()
+    layout = QVBoxLayout(host)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(3)
+    layout.addWidget(widget)
+    lbl = QLabel(hint)
+    lbl.setWordWrap(True)
+    lbl.setObjectName("formHint")
+    layout.addWidget(lbl)
+    return host
+
+
+class _SegmentedControl(QWidget):
+    """Exclusive horizontal button group that emits valueChanged(str) on selection."""
+
+    valueChanged = Signal(str)
+
+    def __init__(self, options: list[tuple[str, str]], *, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        self._buttons: list[tuple[str, QPushButton]] = []
+        for i, (label, value) in enumerate(options):
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setObjectName("segBtn")
+            btn.setProperty("segPos", "left" if i == 0 else ("right" if i == len(options) - 1 else "mid"))
+            btn.clicked.connect(lambda checked, v=value: self._on_clicked(v))
+            btn.setToolTip(value or "Default")
+            self._buttons.append((value, btn))
+            layout.addWidget(btn)
+        if self._buttons:
+            self._buttons[0][1].setChecked(True)
+        self._current = self._buttons[0][0] if self._buttons else ""
+
+    def _on_clicked(self, value: str) -> None:
+        for v, btn in self._buttons:
+            btn.setChecked(v == value)
+        if value != self._current:
+            self._current = value
+            self.valueChanged.emit(value)
+
+    def value(self) -> str:
+        return self._current
+
+    def setValue(self, value: str) -> None:
+        matched = any(v for v, _ in self._buttons if v == value)
+        target = value if matched else (self._buttons[0][0] if self._buttons else "")
+        for v, btn in self._buttons:
+            btn.setChecked(v == target)
+        self._current = target
+
+    def currentData(self) -> str:
+        return self._current
+
+
+class _LabelPositionPicker(QWidget):
+    """3×3 spatial grid for picking the default label position."""
+
+    valueChanged = Signal(str)
+
+    _GRID: list[tuple[str, str, str]] = [
+        # (display, value, tooltip)
+        ("↖", "lt", "Top-left"),   ("↑", "ct", "Top-center"),   ("↗", "rt", "Top-right"),
+        ("←", "lc", "Left-center"), ("·", "",  "Default"),       ("→", "rc", "Right-center"),
+        ("↙", "lb", "Bottom-left"), ("↓", "cb", "Bottom-center"), ("↘", "rb", "Bottom-right"),
+    ]
+
+    def __init__(self, *, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        grid = QGridLayout(self)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(2)
+        self._buttons: list[tuple[str, QPushButton]] = []
+        for idx, (label, value, tip) in enumerate(self._GRID):
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setObjectName("posBtn")
+            btn.setFixedSize(30, 26)
+            btn.setToolTip(tip)
+            btn.clicked.connect(lambda checked, v=value: self._on_clicked(v))
+            self._buttons.append((value, btn))
+            grid.addWidget(btn, idx // 3, idx % 3)
+        self._current = ""
+        self._buttons[4][1].setChecked(True)  # default = center
+
+    def _on_clicked(self, value: str) -> None:
+        for v, btn in self._buttons:
+            btn.setChecked(v == value)
+        if value != self._current:
+            self._current = value
+            self.valueChanged.emit(value)
+
+    def value(self) -> str:
+        return self._current
+
+    def setValue(self, value: str) -> None:
+        for v, btn in self._buttons:
+            btn.setChecked(v == value)
+        self._current = value
+
+    def currentData(self) -> str:
+        return self._current
+
+
+_KNOWN_DECK_TYPES: list[str] = [
+    "LoupedeckLive",
+    "LoupedeckLiveS",
+    "Stream Deck",
+    "Stream Deck XL",
+    "Stream Deck +",
+    "Stream Deck Mini",
+    "Virtual StreamDeck XL",
+    "Virtual LoupedeckLive",
+    "iPad",
+    "iPhone",
+]
+
+
+class _DeckSetupCard(QFrame):
+    """One row in the Deck Setup form representing a single deck entry."""
+
+    changed = Signal()
+    remove_requested = Signal(object)
+    move_up_requested = Signal(object)
+    move_down_requested = Signal(object)
+
+    def __init__(self, layout_ids: list[str], *, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(8, 6, 8, 6)
+        row.setSpacing(6)
+
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("Deck name")
+        self.name_edit.setMinimumWidth(130)
+        row.addWidget(self.name_edit, 2)
+
+        self.type_combo = _NoWheelComboBox()
+        self.type_combo.setEditable(True)
+        self.type_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        for t in _KNOWN_DECK_TYPES:
+            self.type_combo.addItem(t, t)
+        self.type_combo.lineEdit().setPlaceholderText("Type")
+        self.type_combo.setMinimumWidth(150)
+        row.addWidget(self.type_combo, 2)
+
+        self.layout_combo = _NoWheelComboBox()
+        self.layout_combo.setEditable(True)
+        self.layout_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        for lid in layout_ids:
+            self.layout_combo.addItem(lid, lid)
+        self.layout_combo.lineEdit().setPlaceholderText("Layout folder")
+        self.layout_combo.setMinimumWidth(120)
+        row.addWidget(self.layout_combo, 2)
+
+        self.brightness_spin = _NoWheelSpinBox()
+        self.brightness_spin.setRange(0, 100)
+        self.brightness_spin.setSpecialValueText("—")
+        self.brightness_spin.setSuffix("%")
+        self.brightness_spin.setFixedWidth(64)
+        row.addWidget(self.brightness_spin)
+
+        _BTN_W = 26
+        self.btn_up = QPushButton("↑")
+        self.btn_up.setFixedWidth(_BTN_W)
+        self.btn_up.setToolTip("Move up")
+        self.btn_up.clicked.connect(lambda: self.move_up_requested.emit(self))
+        row.addWidget(self.btn_up)
+
+        self.btn_down = QPushButton("↓")
+        self.btn_down.setFixedWidth(_BTN_W)
+        self.btn_down.setToolTip("Move down")
+        self.btn_down.clicked.connect(lambda: self.move_down_requested.emit(self))
+        row.addWidget(self.btn_down)
+
+        self.btn_remove = QPushButton("✕")
+        self.btn_remove.setFixedWidth(_BTN_W)
+        self.btn_remove.setToolTip("Remove deck")
+        self.btn_remove.clicked.connect(lambda: self.remove_requested.emit(self))
+        row.addWidget(self.btn_remove)
+
+        self.name_edit.textChanged.connect(self.changed)
+        self.type_combo.currentTextChanged.connect(self.changed)
+        self.layout_combo.currentTextChanged.connect(self.changed)
+        self.brightness_spin.valueChanged.connect(self.changed)
+
+    def to_dict(self) -> dict:
+        d: dict = {}
+        name = self.name_edit.text().strip()
+        if name:
+            d["name"] = name
+        dtype = self.type_combo.currentText().strip()
+        if dtype:
+            d["type"] = dtype
+        layout = self.layout_combo.currentText().strip()
+        if layout:
+            d["layout"] = layout
+        brightness = self.brightness_spin.value()
+        if brightness:
+            d["brightness"] = brightness
+        return d
+
+    def from_dict(self, data: dict, *, loading: bool = False) -> None:
+        def _block(widget, value_fn: callable) -> None:
+            widget.blockSignals(True)
+            try:
+                value_fn()
+            finally:
+                widget.blockSignals(False)
+
+        _block(self.name_edit, lambda: self.name_edit.setText(str(data.get("name") or "")))
+        dtype = str(data.get("type") or "")
+        _block(self.type_combo, lambda: (
+            self.type_combo.setCurrentIndex(self.type_combo.findData(dtype))
+            if self.type_combo.findData(dtype) >= 0
+            else self.type_combo.setEditText(dtype)
+        ))
+        layout = str(data.get("layout") or "")
+        _block(self.layout_combo, lambda: (
+            self.layout_combo.setCurrentIndex(self.layout_combo.findData(layout))
+            if self.layout_combo.findData(layout) >= 0
+            else self.layout_combo.setEditText(layout)
+        ))
+        _block(self.brightness_spin, lambda: self.brightness_spin.setValue(int(data.get("brightness") or 0)))
 
 
 def _short_path(path: Path | str, *, max_len: int = 96) -> str:
@@ -1029,6 +1464,10 @@ class EditorTab(QWidget):
         self._config_form_enabled = False
         self._config_yaml_data: dict | None = None
         self._config_form_loading = False
+        self._deck_setup_enabled = False
+        self._deck_setup_data: dict | None = None
+        self._deck_setup_loading = False
+        self._deck_setup_cards: list[_DeckSetupCard] = []
         self._visual_button_order: list[str] = []
         self._visual_buttons: dict[str, dict] = {}
         self._visual_cols = 0
@@ -1126,13 +1565,14 @@ class EditorTab(QWidget):
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(0)
-        left_title = QLabel("Files")
-        left_title.setStyleSheet("font-size: 12px; font-weight: 700; color: #334155; padding: 12px 12px 8px 12px;")
-        left_layout.addWidget(left_title)
+        self.tree_pane_title = QLabel("Files")
+        self.tree_pane_title.setStyleSheet("font-size: 12px; font-weight: 700; color: #334155; padding: 12px 12px 8px 12px;")
+        left_layout.addWidget(self.tree_pane_title)
 
         self.file_tree = _PageDropTree()
         self.file_tree.setHeaderHidden(True)
         self.file_tree.setMinimumWidth(240)
+        self.file_tree.setIndentation(14)
         self.file_tree.itemSelectionChanged.connect(self._on_tree_selection_changed)
         self.file_tree.itemClicked.connect(self._on_tree_item_clicked)
         self.file_tree.page_drop_requested.connect(self._drop_button_on_page)
@@ -1331,58 +1771,156 @@ class EditorTab(QWidget):
         self.config_home_page_edit = QLineEdit()
         self.btn_pick_home_page = QPushButton("Find…")
         self.btn_pick_home_page.clicked.connect(lambda: self._open_layout_page_picker_for_line_edit(self.config_home_page_edit))
-        self.config_form.addRow("Home Page", _field_with_button(self.config_home_page_edit, self.btn_pick_home_page))
+        self.config_form.addRow("Home Page", _field_with_hint(
+            _field_with_button(self.config_home_page_edit, self.btn_pick_home_page),
+            "First page shown when the deck starts.",
+        ))
 
-        self.config_label_font_edit = QLineEdit()
-        self.config_form.addRow("Label Font", self.config_label_font_edit)
+        self.config_label_font_edit = _NoWheelComboBox()
+        self.config_label_font_edit.setEditable(True)
+        self.config_label_font_edit.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.config_label_font_edit.lineEdit().setPlaceholderText("(default)")
+        self.config_form.addRow("Label Font", _field_with_hint(
+            self.config_label_font_edit,
+            "Font file name or family for button labels.",
+        ))
 
         self.config_label_size = _NoWheelSpinBox()
         self.config_label_size.setRange(0, 256)
         self.config_label_size.setSpecialValueText("Unset")
-        self.config_form.addRow("Label Size", self.config_label_size)
+        self.config_form.addRow("Label Size", _field_with_hint(
+            self.config_label_size,
+            "Default label font size in points.",
+        ))
 
         self.config_text_size = _NoWheelSpinBox()
         self.config_text_size.setRange(0, 256)
         self.config_text_size.setSpecialValueText("Unset")
-        self.config_form.addRow("Text Size", self.config_text_size)
+        self.config_form.addRow("Text Size", _field_with_hint(
+            self.config_text_size,
+            "Default font size for text-only buttons.",
+        ))
 
-        self.config_label_color_edit = QLineEdit()
-        self.config_form.addRow("Label Color", self.config_label_color_edit)
+        self.config_label_color_edit = _ColorField()
+        self.config_form.addRow("Label Color", _field_with_hint(
+            self.config_label_color_edit,
+            "Color name, hex code, or RGB tuple — e.g. Gold, #FFD700, (255, 215, 0).",
+        ))
 
-        self.config_label_position = _NoWheelComboBox()
-        self.config_label_position.setEditable(True)
-        for value in ["", "ct", "cb", "lt", "lc", "lb", "rt", "rc", "rb"]:
-            self.config_label_position.addItem(value or "Default", value)
-        self.config_form.addRow("Label Position", self.config_label_position)
+        self.config_label_position = _LabelPositionPicker()
+        self.config_form.addRow("Label Position", _field_with_hint(
+            self.config_label_position,
+            "Where labels are anchored on each button face.",
+        ))
 
-        self.config_vibrate = _NoWheelComboBox()
-        self.config_vibrate.setEditable(True)
-        for value in ["", "SHORT", "LONG"]:
-            self.config_vibrate.addItem(value or "Default", value)
-        self.config_form.addRow("Default Vibrate", self.config_vibrate)
+        self.config_vibrate = _SegmentedControl([
+            ("Off", ""), ("Short", "SHORT"), ("Long", "LONG"),
+        ])
+        self.config_form.addRow("Default Vibrate", _field_with_hint(
+            self.config_vibrate,
+            "Haptic feedback on button press (Loupedeck only).",
+        ))
 
-        self.config_icon_color_edit = QLineEdit()
-        self.config_form.addRow("Icon Color", self.config_icon_color_edit)
+        self.config_icon_color_edit = _ColorField()
+        self.config_form.addRow("Icon Color", _field_with_hint(
+            self.config_icon_color_edit,
+            "Background fill when no image is set — e.g. (94, 111, 130).",
+        ))
 
-        self.config_ann_style = _NoWheelComboBox()
-        self.config_ann_style.addItem("Default", "")
-        self.config_ann_style.addItem("Korry", "k")
-        self.config_ann_style.addItem("Vivisun", "v")
-        self.config_form.addRow("Annun Style", self.config_ann_style)
+        self.config_ann_style = _SegmentedControl([
+            ("Default", ""), ("Korry", "k"), ("Vivisun", "v"),
+        ])
+        self.config_form.addRow("Annun Style", _field_with_hint(
+            self.config_ann_style,
+            "Annunciator render style: Korry = dual-cell, Vivisun = flat.",
+        ))
 
         self.config_light_off_intensity = _NoWheelSpinBox()
         self.config_light_off_intensity.setRange(0, 100)
         self.config_light_off_intensity.setSpecialValueText("Unset")
-        self.config_form.addRow("Light Off Intensity", self.config_light_off_intensity)
+        self.config_form.addRow("Light Off Intensity", _field_with_hint(
+            self.config_light_off_intensity,
+            "Brightness of inactive keys (0 = off, 100 = full).",
+        ))
 
-        self.config_fill_empty_keys = QCheckBox("Fill empty keys")
-        self.config_form.addRow("Grid Fill", self.config_fill_empty_keys)
+        self.config_fill_empty_keys = _SegmentedControl([
+            ("Off", "false"), ("On", "true"),
+        ])
+        self.config_form.addRow("Grid Fill", _field_with_hint(
+            self.config_fill_empty_keys,
+            "Add blank placeholders for every empty button slot.",
+        ))
 
         config_section_layout.addLayout(self.config_form)
         config_section_layout.addStretch(1)
         config_form_wrap.addWidget(self.config_form_section, 0)
         config_form_wrap.addStretch(1)
         self.stack.addWidget(self.config_form_scroll)
+
+        # ── Deck Setup form (top-level deckconfig/config.yaml) ───────────────
+        self.deck_setup_scroll = QScrollArea()
+        self.deck_setup_scroll.setWidgetResizable(True)
+        self.deck_setup_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.deck_setup_host = QWidget()
+        self.deck_setup_scroll.setWidget(self.deck_setup_host)
+        _ds_wrap = QVBoxLayout(self.deck_setup_host)
+        _ds_wrap.setContentsMargins(0, 0, 0, 16)
+        _ds_wrap.setSpacing(16)
+
+        self.deck_setup_hint = QLabel("Visual mode for the project's top-level deck configuration.")
+        self.deck_setup_hint.setWordWrap(True)
+        _ds_wrap.addWidget(self.deck_setup_hint)
+
+        # Aircraft metadata section.
+        self.deck_setup_meta_section = QFrame()
+        self.deck_setup_meta_section.setObjectName("dsSection")
+        _ds_meta_wrap = QVBoxLayout(self.deck_setup_meta_section)
+        _ds_meta_wrap.setContentsMargins(12, 12, 12, 12)
+        _ds_meta_wrap.setSpacing(10)
+        _ds_meta_title = QLabel("Aircraft")
+        _ds_meta_title.setObjectName("dsSectionTitle")
+        _ds_meta_wrap.addWidget(_ds_meta_title)
+        _ds_meta_form = QFormLayout()
+        _ds_meta_form.setContentsMargins(0, 0, 0, 0)
+        _ds_meta_form.setSpacing(8)
+
+        self.ds_aircraft_edit = QLineEdit()
+        _ds_meta_form.addRow("Name", _field_with_hint(self.ds_aircraft_edit, "Aircraft display name shown in the interface."))
+        self.ds_icao_edit = QLineEdit()
+        self.ds_icao_edit.setMaxLength(8)
+        self.ds_icao_edit.setFixedWidth(90)
+        _ds_meta_form.addRow("ICAO", _field_with_hint(self.ds_icao_edit, "ICAO type designator, e.g. A320."))
+        self.ds_model_edit = QLineEdit()
+        _ds_meta_form.addRow("Model", _field_with_hint(self.ds_model_edit, "Optional long model name."))
+        self.ds_description_edit = QLineEdit()
+        _ds_meta_form.addRow("Description", _field_with_hint(self.ds_description_edit, "Short description shown in config browsers."))
+        _ds_meta_wrap.addLayout(_ds_meta_form)
+        _ds_wrap.addWidget(self.deck_setup_meta_section)
+
+        # Decks list section.
+        self.deck_setup_decks_section = QFrame()
+        self.deck_setup_decks_section.setObjectName("dsSection")
+        _ds_decks_wrap = QVBoxLayout(self.deck_setup_decks_section)
+        _ds_decks_wrap.setContentsMargins(12, 12, 12, 12)
+        _ds_decks_wrap.setSpacing(8)
+        _ds_decks_title = QLabel("Decks")
+        _ds_decks_title.setObjectName("dsSectionTitle")
+        _ds_decks_wrap.addWidget(_ds_decks_title)
+
+        self.deck_setup_cards_host = QWidget()
+        self.deck_setup_cards_layout = QVBoxLayout(self.deck_setup_cards_host)
+        self.deck_setup_cards_layout.setContentsMargins(0, 0, 0, 0)
+        self.deck_setup_cards_layout.setSpacing(4)
+        _ds_decks_wrap.addWidget(self.deck_setup_cards_host)
+
+        self.btn_add_deck = QPushButton("+ Add Deck")
+        self.btn_add_deck.setObjectName("addDeckBtn")
+        self.btn_add_deck.clicked.connect(self._add_new_deck_card)
+        _ds_decks_wrap.addWidget(self.btn_add_deck, 0, Qt.AlignmentFlag.AlignLeft)
+        _ds_wrap.addWidget(self.deck_setup_decks_section)
+        _ds_wrap.addStretch(1)
+
+        self.stack.addWidget(self.deck_setup_scroll)
 
         self.button_edit_page = QWidget()
         button_edit_layout = QVBoxLayout(self.button_edit_page)
@@ -1403,7 +1941,7 @@ class EditorTab(QWidget):
         self.button_preview_label = QLabel()
         self.button_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.button_preview_label.setMinimumSize(120, 120)
-        self.button_preview_label.setMaximumSize(160, 160)
+        self.button_preview_label.setMaximumSize(400, 300)
         self.button_preview_label.setWordWrap(True)
         self.button_preview_label.setStyleSheet("border: none;")
         self.button_preview_status = QLabel("Preview will appear here.")
@@ -1954,18 +2492,26 @@ class EditorTab(QWidget):
 
         for widget, signal_name in (
             (self.config_home_page_edit, "textChanged"),
-            (self.config_label_font_edit, "textChanged"),
+            (self.config_label_font_edit, "currentTextChanged"),
             (self.config_label_size, "valueChanged"),
             (self.config_text_size, "valueChanged"),
             (self.config_label_color_edit, "textChanged"),
-            (self.config_label_position, "currentIndexChanged"),
-            (self.config_vibrate, "currentIndexChanged"),
+            (self.config_label_position, "valueChanged"),
+            (self.config_vibrate, "valueChanged"),
             (self.config_icon_color_edit, "textChanged"),
-            (self.config_ann_style, "currentIndexChanged"),
+            (self.config_ann_style, "valueChanged"),
             (self.config_light_off_intensity, "valueChanged"),
-            (self.config_fill_empty_keys, "stateChanged"),
+            (self.config_fill_empty_keys, "valueChanged"),
         ):
             getattr(widget, signal_name).connect(self._apply_config_fields_to_editor)
+
+        for ds_widget in (
+            self.ds_aircraft_edit,
+            self.ds_icao_edit,
+            self.ds_model_edit,
+            self.ds_description_edit,
+        ):
+            ds_widget.textChanged.connect(self._apply_deck_setup_to_editor)
 
         self.stack.addWidget(self.button_edit_page)
 
@@ -2050,6 +2596,27 @@ class EditorTab(QWidget):
             self._update_action_state()
             return
 
+        model = _build_deck_tree_model(current)
+        if model is None:
+            # Not a Cockpitdecks project — fall back to flat view.
+            self.tree_pane_title.setText("Files")
+            self._populate_flat_tree(current)
+            return
+
+        file_count = self._populate_deck_tree(model)
+        if file_count == 0:
+            self.tree_pane_title.setText("Files")
+            self.status_label.setText("No editable config files found under this root.")
+            self._update_action_state()
+            return
+
+        self.file_tree.expandAll()
+        self._update_tree_dirty_state()
+        self.status_label.setText(f"{file_count} editable files loaded.")
+        self._update_action_state()
+
+    def _populate_flat_tree(self, current: Path) -> None:
+        """Legacy filesystem-mirror view, used when the folder is not a Cockpitdecks project."""
         files = self._collect_target_files(current)
         if not files:
             self.status_label.setText("No editable config files found under this root.")
@@ -2065,21 +2632,166 @@ class EditorTab(QWidget):
                 item = nodes.get(key)
                 if item is None:
                     item = QTreeWidgetItem([part])
+                    node_path = current / Path(*key)
                     if depth == len(parts) - 1:
                         item.setData(0, Qt.ItemDataRole.UserRole, str(current / rel_path))
+                    elif node_path.is_dir():
+                        item.setData(0, Qt.ItemDataRole.UserRole + 1, str(node_path))
                     parent.addChild(item) if isinstance(parent, QTreeWidgetItem) else parent.addTopLevelItem(item)
                     nodes[key] = item
-                node_path = current / Path(*key)
-                if node_path.is_dir():
-                    config_path = node_path / "config.yaml"
-                    if config_path.is_file() and not item.data(0, Qt.ItemDataRole.UserRole):
-                        item.setData(0, Qt.ItemDataRole.UserRole, str(config_path))
                 parent = item
 
         self.file_tree.expandAll()
         self._update_tree_dirty_state()
         self.status_label.setText(f"{len(files)} editable files loaded.")
         self._update_action_state()
+
+    def _populate_deck_tree(self, model: _DeckTreeModel) -> int:
+        """Build the deck-first grouped tree. Returns the number of file leaves added."""
+        file_count = 0
+
+        # ── colours & fonts ──────────────────────────────────────────────────
+        fg_deck = QColor("#0f172a")
+        fg_category = QColor("#64748b")
+        fg_missing = QColor("#dc2626")
+        font_deck = QFont()
+        font_deck.setBold(True)
+        font_category = QFont()
+        font_category.setItalic(True)
+
+        # ── helpers ──────────────────────────────────────────────────────────
+        def _make_group(label: str, *, folder: Path | None = None, is_deck: bool = False) -> QTreeWidgetItem:
+            node = QTreeWidgetItem([label])
+            if folder is not None:
+                node.setData(0, Qt.ItemDataRole.UserRole + 1, str(folder))
+            if is_deck:
+                node.setFont(0, font_deck)
+                node.setForeground(0, fg_deck)
+            else:
+                node.setFont(0, font_category)
+                node.setForeground(0, fg_category)
+            return node
+
+        def _make_file_leaf(label: str, path: Path) -> QTreeWidgetItem:
+            node = QTreeWidgetItem([label])
+            node.setData(0, Qt.ItemDataRole.UserRole, str(path))
+            return node
+
+        # ── aircraft name as pane title ──────────────────────────────────────
+        self.tree_pane_title.setText(model.aircraft_name or "Files")
+
+        # ── Deck Setup (top-level config.yaml) ───────────────────────────────
+        if model.top_config is not None:
+            setup = _make_file_leaf("Deck Setup", model.top_config)
+            setup.setToolTip(0, str(model.top_config))
+            self.file_tree.addTopLevelItem(setup)
+            file_count += 1
+
+        # ── One group per deck ───────────────────────────────────────────────
+        for deck in model.decks:
+            # Read home-page-name from the layout's config.yaml if present.
+            home_page = ""
+            if deck.layout_config is not None:
+                try:
+                    lc = yaml.safe_load(deck.layout_config.read_text(encoding="utf-8")) or {}
+                    home_page = str(lc.get("home-page-name") or "").strip()
+                except Exception:
+                    pass
+
+            # Build deck group label.
+            parts_label = [deck.deck_name]
+            if deck.brightness:
+                parts_label.append(f"{deck.brightness}%")
+            if deck.pages:
+                parts_label.append(f"{len(deck.pages)} page{'s' if len(deck.pages) != 1 else ''}")
+            deck_label = "  ·  ".join(parts_label)
+
+            if deck.missing:
+                deck_label = f"{deck_label}  ·  missing layout: {deck.layout_id}"
+            deck_node = _make_group(
+                deck_label,
+                folder=deck.layout_dir if not deck.missing else None,
+                is_deck=True,
+            )
+            deck_node.setToolTip(0, str(deck.layout_dir))
+            if deck.missing:
+                deck_node.setForeground(0, fg_missing)
+            self.file_tree.addTopLevelItem(deck_node)
+
+            # Defaults leaf.
+            if deck.layout_config is not None:
+                defaults = _make_file_leaf("Defaults", deck.layout_config)
+                defaults.setToolTip(0, str(deck.layout_config))
+                deck_node.addChild(defaults)
+                file_count += 1
+
+            # Pages group with home-page marker.
+            if deck.pages:
+                pages_label = f"Pages ({len(deck.pages)})"
+                pages_group = _make_group(pages_label, folder=deck.layout_dir)
+                for page in deck.pages:
+                    page_label = page.stem
+                    if home_page and page.stem == home_page:
+                        page_label = f"{page.stem}  (home)"
+                        leaf = _make_file_leaf(page_label, page)
+                        lf = QFont()
+                        lf.setBold(True)
+                        leaf.setFont(0, lf)
+                    else:
+                        leaf = _make_file_leaf(page_label, page)
+                    leaf.setToolTip(0, str(page))
+                    pages_group.addChild(leaf)
+                    file_count += 1
+                deck_node.addChild(pages_group)
+
+            if deck.includes:
+                includes_label_base = "Includes"
+                includes_label = f"{includes_label_base} ({len(deck.includes)})"
+                includes_group = _make_group(includes_label, folder=deck.layout_dir)
+                for inc in deck.includes:
+                    try:
+                        rel = inc.relative_to(deck.layout_dir)
+                        label = rel.as_posix()
+                    except ValueError:
+                        label = inc.name
+                    leaf = _make_file_leaf(label, inc)
+                    leaf.setToolTip(0, str(inc))
+                    includes_group.addChild(leaf)
+                    file_count += 1
+                deck_node.addChild(includes_group)
+
+        # ── Shared bucket ────────────────────────────────────────────────────
+        if model.shared_files:
+            shared_group = _make_group(
+                f"Shared ({len(model.shared_files)})",
+                folder=model.target_root,
+            )
+            dir_nodes: dict[tuple[str, ...], QTreeWidgetItem] = {}
+            for path in model.shared_files:
+                try:
+                    rel = path.relative_to(model.target_root)
+                except ValueError:
+                    continue
+                parts = rel.parts
+                parent_item: QTreeWidgetItem = shared_group
+                for depth, part in enumerate(parts):
+                    key = tuple(parts[: depth + 1])
+                    if depth == len(parts) - 1:
+                        leaf = _make_file_leaf(part, path)
+                        leaf.setToolTip(0, str(path))
+                        parent_item.addChild(leaf)
+                        file_count += 1
+                    else:
+                        item = dir_nodes.get(key)
+                        if item is None:
+                            folder_path = model.target_root / Path(*key)
+                            item = _make_group(part, folder=folder_path)
+                            parent_item.addChild(item)
+                            dir_nodes[key] = item
+                        parent_item = item
+            self.file_tree.addTopLevelItem(shared_group)
+
+        return file_count
 
     def save_current_file(self) -> bool:
         if self._current_file_path is None:
@@ -2183,6 +2895,8 @@ class EditorTab(QWidget):
         self._clear_dirty_indicator()
         self._visual_reset()
         self.path_label.setText("No root open" if path is None else _short_path(path))
+        if path is None:
+            self.tree_pane_title.setText("Files")
         self._warm_preview_pool_async(path)
         self.refresh_tree()
 
@@ -2364,16 +3078,16 @@ class EditorTab(QWidget):
 
     def _restore_tree_selection(self) -> None:
         """Re-select the currently open file in the tree after a cancelled navigation."""
-        if self._current_file_path is None or self._current_target_path is None:
+        if self._current_file_path is None:
             return
-        rel = self._current_file_path.relative_to(self._current_target_path)
+        target = str(self._current_file_path)
         stack: list[QTreeWidgetItem] = [self.file_tree.invisibleRootItem()]
         while stack:
             node = stack.pop()
             for i in range(node.childCount()):
                 child = node.child(i)
                 raw = child.data(0, Qt.ItemDataRole.UserRole)
-                if raw and Path(str(raw)) == rel:
+                if raw and str(raw) == target:
                     self.file_tree.blockSignals(True)
                     self.file_tree.setCurrentItem(child)
                     self.file_tree.blockSignals(False)
@@ -2503,10 +3217,125 @@ class EditorTab(QWidget):
         if self._visual_enabled and self.stack.currentWidget() is self.visual_scroll:
             self._queue_visible_previews()
 
+    # ── Deck Setup helpers ────────────────────────────────────────────────
+
+    def _is_top_config_file(self, path: Path | None) -> bool:
+        if path is None or path.name != "config.yaml":
+            return False
+        return path.parent.name == "deckconfig"
+
+    def _layout_ids_for_target(self) -> list[str]:
+        if self._current_target_path is None:
+            return []
+        deckconfig = self._current_target_path / "deckconfig"
+        if not deckconfig.is_dir():
+            return []
+        return sorted(
+            p.name for p in deckconfig.iterdir()
+            if p.is_dir() and p.name != "resources"
+        )
+
+    def _load_deck_setup_from_data(self, data: dict) -> None:
+        self._deck_setup_loading = True
+        try:
+            self.ds_aircraft_edit.setText(str(data.get("aircraft") or ""))
+            self.ds_icao_edit.setText(str(data.get("icao") or ""))
+            self.ds_model_edit.setText(str(data.get("model") or ""))
+            self.ds_description_edit.setText(str(data.get("description") or ""))
+            self._rebuild_deck_cards(data.get("decks") or [])
+        finally:
+            self._deck_setup_loading = False
+
+    def _rebuild_deck_cards(self, decks: list) -> None:
+        layout_ids = self._layout_ids_for_target()
+        # Clear existing cards.
+        while self.deck_setup_cards_layout.count():
+            item = self.deck_setup_cards_layout.takeAt(0)
+            if item and item.widget():
+                item.widget().deleteLater()
+        self._deck_setup_cards = []
+        for deck in decks:
+            if isinstance(deck, dict):
+                self._add_deck_setup_card(deck, layout_ids=layout_ids)
+
+    def _add_deck_setup_card(self, deck: dict | None = None, *, layout_ids: list[str] | None = None) -> _DeckSetupCard:
+        ids = layout_ids if layout_ids is not None else self._layout_ids_for_target()
+        card = _DeckSetupCard(ids)
+        if deck:
+            card.from_dict(deck)
+        card.changed.connect(self._apply_deck_setup_to_editor)
+        card.remove_requested.connect(self._remove_deck_card)
+        card.move_up_requested.connect(lambda c: self._move_deck_card(c, -1))
+        card.move_down_requested.connect(lambda c: self._move_deck_card(c, 1))
+        self.deck_setup_cards_layout.addWidget(card)
+        self._deck_setup_cards.append(card)
+        self._apply_deck_card_styles()
+        return card
+
+    def _add_new_deck_card(self) -> None:
+        self._add_deck_setup_card()
+        self._apply_deck_setup_to_editor()
+        self.deck_setup_scroll.verticalScrollBar().setValue(
+            self.deck_setup_scroll.verticalScrollBar().maximum()
+        )
+
+    def _remove_deck_card(self, card: _DeckSetupCard) -> None:
+        if card in self._deck_setup_cards:
+            self._deck_setup_cards.remove(card)
+            self.deck_setup_cards_layout.removeWidget(card)
+            card.deleteLater()
+            self._apply_deck_card_styles()
+            self._apply_deck_setup_to_editor()
+
+    def _move_deck_card(self, card: _DeckSetupCard, direction: int) -> None:
+        idx = self._deck_setup_cards.index(card) if card in self._deck_setup_cards else -1
+        new_idx = idx + direction
+        if idx < 0 or not (0 <= new_idx < len(self._deck_setup_cards)):
+            return
+        self._deck_setup_cards.pop(idx)
+        self._deck_setup_cards.insert(new_idx, card)
+        self.deck_setup_cards_layout.removeWidget(card)
+        self.deck_setup_cards_layout.insertWidget(new_idx, card)
+        self._apply_deck_card_styles()
+        self._apply_deck_setup_to_editor()
+
+    def _apply_deck_card_styles(self) -> None:
+        n = len(self._deck_setup_cards)
+        for i, card in enumerate(self._deck_setup_cards):
+            card.btn_up.setEnabled(i > 0)
+            card.btn_down.setEnabled(i < n - 1)
+
+    def _apply_deck_setup_to_editor(self) -> None:
+        if self._deck_setup_loading or self._deck_setup_data is None:
+            return
+        data = dict(self._deck_setup_data)
+
+        def _set_or_pop(key: str, value: str) -> None:
+            if value:
+                data[key] = value
+            else:
+                data.pop(key, None)
+
+        _set_or_pop("aircraft", self.ds_aircraft_edit.text().strip())
+        _set_or_pop("icao", self.ds_icao_edit.text().strip())
+        _set_or_pop("model", self.ds_model_edit.text().strip())
+        _set_or_pop("description", self.ds_description_edit.text().strip())
+        decks = [c.to_dict() for c in self._deck_setup_cards if c.to_dict()]
+        if decks:
+            data["decks"] = decks
+        else:
+            data.pop("decks", None)
+
+        self._deck_setup_data = data
+        dumped = yaml.safe_dump(data, sort_keys=False, allow_unicode=False)
+        self._set_editor_text(dumped, mark_modified=True)
+        self.status_label.setText("Updated deck setup.")
+        self._update_action_state()
+
     def _refresh_font_combos(self) -> None:
         fonts = list_preview_fonts(self._current_target_path) if self._current_target_path else []
-        for row in self.visual_ann_part_rows:
-            combo = row["font_combo"]
+        combos = [row["font_combo"] for row in self.visual_ann_part_rows] + [self.config_label_font_edit]
+        for combo in combos:
             current = combo.currentText().strip()
             combo.blockSignals(True)
             combo.clear()
@@ -2533,19 +3362,20 @@ class EditorTab(QWidget):
         item = self.file_tree.itemAt(pos)
         if item is None or self._current_target_path is None:
             return
-        # Reconstruct the absolute path from the item hierarchy
-        parts: list[str] = []
-        cursor: QTreeWidgetItem | None = item
-        while cursor is not None:
-            parts.insert(0, cursor.text(0))
-            cursor = cursor.parent()
-        item_path = self._current_target_path / Path(*parts)
-        folder_path = item_path if item_path.is_dir() else item_path.parent
-        rel_folder = folder_path.relative_to(self._current_target_path)
-        # Offer "New Page" only for layout-like folders (not the root, not under resources/)
+        file_raw = item.data(0, Qt.ItemDataRole.UserRole)
+        folder_raw = item.data(0, Qt.ItemDataRole.UserRole + 1)
+        if file_raw:
+            file_path = Path(str(file_raw))
+            folder_path = file_path.parent
+        elif folder_raw:
+            folder_path = Path(str(folder_raw))
+        else:
+            return
+        # Offer "New Page" only for deck layout folders (direct children of deckconfig/).
+        deckconfig = self._current_target_path / "deckconfig"
         is_layout_folder = (
-            folder_path != self._current_target_path
-            and "resources" not in rel_folder.parts
+            folder_path.parent == deckconfig
+            and (folder_path / "config.yaml").is_file()
         )
         menu = QMenu(self)
         new_page_action = menu.addAction("New Page…") if is_layout_folder else None
@@ -2681,12 +3511,54 @@ class EditorTab(QWidget):
         self.zoom_label.setStyleSheet(f"font-size: 11px; color: {subfg};")
         self._designer_panel.setStyleSheet(common_panel)
         self.config_form_section.setStyleSheet(common_panel)
+        self.deck_setup_meta_section.setStyleSheet(common_panel)
+        self.deck_setup_decks_section.setStyleSheet(common_panel)
+        self.deck_setup_hint.setStyleSheet(f"font-size: 11px; color: {subfg};")
+        for lbl in self.deck_setup_host.findChildren(QLabel, "dsSectionTitle"):
+            lbl.setStyleSheet(f"font-size: 12px; font-weight: 700; color: {fg};")
+        card_style = (
+            f"_DeckSetupCard {{ background: {card_bg}; border: 1px solid {border}; border-radius: 6px; }}"
+        )
+        for card in self._deck_setup_cards:
+            card.setStyleSheet(card_style)
+        self.btn_add_deck.setStyleSheet(button_style)
         self.visual_activation_section.setStyleSheet(common_panel)
         self.visual_representation_section.setStyleSheet(common_panel)
         self.config_form_title.setStyleSheet(f"font-size: 12px; font-weight: 700; color: {fg};")
         self.visual_activation_title.setStyleSheet(f"font-size: 12px; font-weight: 700; color: {fg};")
         self.visual_representation_title.setStyleSheet(f"font-size: 12px; font-weight: 700; color: {fg};")
         self.button_preview_status.setStyleSheet(f"font-size: 10px; color: {subfg};")
+
+        # ── form hint labels ────────────────────────────────────────────────
+        hint_style = f"font-size: 10px; color: {subfg}; font-style: italic;"
+        self.config_form_host.setStyleSheet(f"QLabel#formHint {{ {hint_style} }}")
+
+        # ── _SegmentedControl buttons ───────────────────────────────────────
+        seg_base = (
+            f"QPushButton[objectName='segBtn'] {{"
+            f" border: 1px solid {border}; background: {panel_bg}; color: {fg};"
+            f" font-size: 11px; padding: 3px 10px; border-radius: 0; min-height: 24px; }}"
+            f"QPushButton[objectName='segBtn']:checked {{"
+            f" background: #dbeafe; color: #1d4ed8; border-color: #93c5fd; }}"
+            f"QPushButton[objectName='segBtn'][segPos='left'] {{ border-top-left-radius: 6px; border-bottom-left-radius: 6px; }}"
+            f"QPushButton[objectName='segBtn'][segPos='right'] {{ border-top-right-radius: 6px; border-bottom-right-radius: 6px; }}"
+            f"QPushButton[objectName='segBtn'][segPos='mid'] {{ border-left-width: 0; }}"
+        )
+        self.config_form_host.setStyleSheet(
+            self.config_form_host.styleSheet() + seg_base
+        )
+
+        # ── _LabelPositionPicker buttons ────────────────────────────────────
+        pos_base = (
+            f"QPushButton[objectName='posBtn'] {{"
+            f" border: 1px solid {border}; background: {panel_bg}; color: {fg};"
+            f" font-size: 13px; border-radius: 4px; }}"
+            f"QPushButton[objectName='posBtn']:checked {{"
+            f" background: #dbeafe; color: #1d4ed8; border-color: #93c5fd; }}"
+        )
+        self.config_form_host.setStyleSheet(
+            self.config_form_host.styleSheet() + pos_base
+        )
 
     def _switch_mode(self, mode: str, *, force: bool = False) -> None:
         if mode == "visual":
@@ -2695,14 +3567,17 @@ class EditorTab(QWidget):
                 self.stack.setCurrentWidget(self.editor)
                 return
             self.btn_visual_view.setChecked(True)
-            if self._config_form_enabled:
+            if self._deck_setup_enabled:
+                self.stack.setCurrentWidget(self.deck_setup_scroll)
+                self.status_label.setText("Visual mode: editing deck setup.")
+            elif self._config_form_enabled:
                 self.stack.setCurrentWidget(self.config_form_scroll)
                 self.status_label.setText("Visual mode: editing layout config fields.")
             else:
                 self.stack.setCurrentWidget(self.visual_scroll)
                 self.status_label.setText("Visual mode: drag buttons in the grid or double-click one to edit it.")
             self._preferred_mode = "visual"
-            if not self._config_form_enabled:
+            if not self._config_form_enabled and not self._deck_setup_enabled:
                 QTimer.singleShot(0, self._fit_visual_zoom)
         else:
             self.btn_text_view.setChecked(True)
@@ -2729,6 +3604,17 @@ class EditorTab(QWidget):
             if show_errors:
                 QMessageBox.warning(self, "Visual mode unavailable", f"YAML parse failed:\n{exc}")
             return False
+        if self._is_top_config_file(self._current_file_path):
+            if not isinstance(data, dict):
+                self._visual_reset()
+                self.btn_visual_view.setEnabled(False)
+                return False
+            self._deck_setup_enabled = True
+            self._deck_setup_data = data
+            self._visual_enabled = True
+            self.btn_visual_view.setEnabled(True)
+            self._load_deck_setup_from_data(data)
+            return True
         if self._is_layout_config_file(self._current_file_path):
             if not isinstance(data, dict):
                 self._visual_reset()
@@ -2778,11 +3664,8 @@ class EditorTab(QWidget):
         self._loupedeck_encoder_mode = deck_type == "LoupedeckLive" and is_encoder_file
         self._included_buttons = {}
         layout_dir = self._resolve_layout_dir(self._current_file_path)
-        if self._loupedeck_live_mode:
-            if layout_dir is not None:
-                self._included_buttons = self._load_encoder_includes(data, layout_dir)
-        elif layout_dir is not None:
-            self._included_buttons = self._load_page_includes(data, layout_dir)
+        if layout_dir is not None:
+            self._included_buttons = self._load_includes(data, layout_dir)
 
         self._visual_cols, self._visual_rows = self._infer_grid_dimensions(self._current_file_path, buttons)
         self._visual_enabled = True
@@ -2796,6 +3679,8 @@ class EditorTab(QWidget):
         self._visual_yaml_data = None
         self._config_form_enabled = False
         self._config_yaml_data = None
+        self._deck_setup_enabled = False
+        self._deck_setup_data = None
         self._visual_buttons = {}
         self._visual_button_order = []
         self._visual_cols = 0
@@ -2875,42 +3760,8 @@ class EditorTab(QWidget):
                 return str(deck.get("type") or "").strip() or None
         return None
 
-    def _load_encoder_includes(self, page_data: dict, layout_dir: Path) -> dict[str, tuple[dict, Path]]:
-        """Load encoder buttons from all encoder-subdirectory includes in page_data.
-
-        Returns a dict mapping button_id → (button_dict, source_path) for encoder buttons
-        found in include files.  Only includes whose resolved path is inside an 'encoders'
-        sub-directory are processed (to avoid loading page-level includes).
-        """
-        result: dict[str, tuple[dict, Path]] = {}
-        raw_includes = page_data.get("includes")
-        if isinstance(raw_includes, str):
-            include_names = [p.strip() for p in raw_includes.split(",") if p.strip()]
-        elif isinstance(raw_includes, list):
-            include_names = [str(p).strip() for p in raw_includes if str(p).strip()]
-        else:
-            return result
-        for name in include_names:
-            inc_path = layout_dir / f"{name}.yaml"
-            if not inc_path.is_file():
-                continue
-            if "encoders" not in inc_path.parts:
-                continue  # skip non-encoder includes (e.g. pager)
-            try:
-                inc_data = yaml.safe_load(inc_path.read_text(encoding="utf-8")) or {}
-            except Exception:
-                continue
-            if not isinstance(inc_data, dict):
-                continue
-            for idx, btn in enumerate(inc_data.get("buttons") or []):
-                if not isinstance(btn, dict):
-                    continue
-                button_id = f"inc-{name.replace('/', '-')}-{idx}"
-                result[button_id] = (btn, inc_path)
-        return result
-
-    def _load_page_includes(self, page_data: dict, layout_dir: Path) -> dict[str, tuple[dict, Path]]:
-        """Load buttons from page-level includes (e.g. a shared pager sidebar).
+    def _load_includes(self, page_data: dict, layout_dir: Path) -> dict[str, tuple[dict, Path]]:
+        """Load buttons from all includes listed in page_data.
 
         Returns a dict mapping button_id → (button_dict, source_path).
         """
@@ -2959,16 +3810,16 @@ class EditorTab(QWidget):
         self._config_form_loading = True
         try:
             self.config_home_page_edit.setText(str(data.get("home-page-name") or ""))
-            self.config_label_font_edit.setText(str(data.get("default-label-font") or ""))
+            self._combo_set_data_or_text(self.config_label_font_edit, str(data.get("default-label-font") or ""))
             self.config_label_size.setValue(int(data.get("default-label-size") or 0))
             self.config_text_size.setValue(int(data.get("default-text-size") or 0))
             self.config_label_color_edit.setText(str(data.get("default-label-color") or ""))
-            self._combo_set_data_or_text(self.config_label_position, str(data.get("default-label-position") or ""))
-            self._combo_set_data_or_text(self.config_vibrate, str(data.get("default-vibrate") or ""))
+            self.config_label_position.setValue(str(data.get("default-label-position") or ""))
+            self.config_vibrate.setValue(str(data.get("default-vibrate") or ""))
             self.config_icon_color_edit.setText(str(data.get("default-icon-color") or ""))
-            self._combo_set_data_or_text(self.config_ann_style, str(data.get("default-annunciator-style") or ""))
+            self.config_ann_style.setValue(str(data.get("default-annunciator-style") or ""))
             self.config_light_off_intensity.setValue(int(data.get("default-light-off-intensity") or 0))
-            self.config_fill_empty_keys.setChecked(bool(data.get("fill-empty-keys", False)))
+            self.config_fill_empty_keys.setValue("true" if data.get("fill-empty-keys") else "false")
         finally:
             self._config_form_loading = False
 
@@ -2985,16 +3836,16 @@ class EditorTab(QWidget):
                 data[key] = value
 
         _set_or_pop("home-page-name", self.config_home_page_edit.text().strip())
-        _set_or_pop("default-label-font", self.config_label_font_edit.text().strip())
+        _set_or_pop("default-label-font", self.config_label_font_edit.currentText().strip())
         _set_or_pop("default-label-size", self.config_label_size.value())
         _set_or_pop("default-text-size", self.config_text_size.value())
         _set_or_pop("default-label-color", self.config_label_color_edit.text().strip())
-        _set_or_pop("default-label-position", (self.config_label_position.currentData() or self.config_label_position.currentText()).strip())
-        _set_or_pop("default-vibrate", (self.config_vibrate.currentData() or self.config_vibrate.currentText()).strip())
+        _set_or_pop("default-label-position", self.config_label_position.value())
+        _set_or_pop("default-vibrate", self.config_vibrate.value())
         _set_or_pop("default-icon-color", self.config_icon_color_edit.text().strip())
-        _set_or_pop("default-annunciator-style", str(self.config_ann_style.currentData() or "").strip())
+        _set_or_pop("default-annunciator-style", self.config_ann_style.value())
         _set_or_pop("default-light-off-intensity", self.config_light_off_intensity.value())
-        if self.config_fill_empty_keys.isChecked():
+        if self.config_fill_empty_keys.value() == "true":
             data["fill-empty-keys"] = True
         else:
             data.pop("fill-empty-keys", None)
@@ -4070,12 +4921,14 @@ class EditorTab(QWidget):
         if isinstance(image_bytes, (bytes, bytearray)) and image_bytes:
             pixmap = QPixmap()
             if pixmap.loadFromData(bytes(image_bytes), "PNG"):
-                target = max(120, min(self.button_preview_label.width(), self.button_preview_label.height()))
-                src_w = max(1, pixmap.width())
-                src_h = max(1, pixmap.height())
-                dpr = max(1.0, min(src_w / target, src_h / target))
-                pixmap.setDevicePixelRatio(dpr)
-                self.button_preview_label.setPixmap(pixmap)
+                label_w = max(120, self.button_preview_label.width())
+                label_h = max(120, self.button_preview_label.height())
+                scaled_pixmap = pixmap.scaled(
+                    label_w, label_h,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                self.button_preview_label.setPixmap(scaled_pixmap)
                 self.button_preview_status.setText(f"Warning: {warning}" if warning else "Live native preview")
                 return
             error = error or "preview decode failed"
