@@ -1793,12 +1793,27 @@ class EditorTab(QWidget):
             "Default label font size in points.",
         ))
 
+        self.config_text_font_edit = _NoWheelComboBox()
+        self.config_text_font_edit.setEditable(True)
+        self.config_text_font_edit.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.config_text_font_edit.lineEdit().setPlaceholderText("(default)")
+        self.config_form.addRow("Text Font", _field_with_hint(
+            self.config_text_font_edit,
+            "Font file name or family for text-only buttons.",
+        ))
+
         self.config_text_size = _NoWheelSpinBox()
         self.config_text_size.setRange(0, 256)
         self.config_text_size.setSpecialValueText("Unset")
         self.config_form.addRow("Text Size", _field_with_hint(
             self.config_text_size,
             "Default font size for text-only buttons.",
+        ))
+
+        self.config_text_color_edit = _ColorField()
+        self.config_form.addRow("Text Color", _field_with_hint(
+            self.config_text_color_edit,
+            "Color name, hex code, or RGB tuple for text-only buttons — e.g. cyan, #00FFFF.",
         ))
 
         self.config_label_color_edit = _ColorField()
@@ -1825,6 +1840,12 @@ class EditorTab(QWidget):
         self.config_form.addRow("Icon Color", _field_with_hint(
             self.config_icon_color_edit,
             "Background fill when no image is set — e.g. (94, 111, 130).",
+        ))
+
+        self.config_cockpit_color_edit = _ColorField()
+        self.config_form.addRow("Cockpit Color", _field_with_hint(
+            self.config_cockpit_color_edit,
+            "Overall cockpit background color — e.g. (40, 40, 40).",
         ))
 
         self.config_ann_style = _SegmentedControl([
@@ -2494,11 +2515,14 @@ class EditorTab(QWidget):
             (self.config_home_page_edit, "textChanged"),
             (self.config_label_font_edit, "currentTextChanged"),
             (self.config_label_size, "valueChanged"),
+            (self.config_text_font_edit, "currentTextChanged"),
             (self.config_text_size, "valueChanged"),
+            (self.config_text_color_edit, "textChanged"),
             (self.config_label_color_edit, "textChanged"),
             (self.config_label_position, "valueChanged"),
             (self.config_vibrate, "valueChanged"),
             (self.config_icon_color_edit, "textChanged"),
+            (self.config_cockpit_color_edit, "textChanged"),
             (self.config_ann_style, "valueChanged"),
             (self.config_light_off_intensity, "valueChanged"),
             (self.config_fill_empty_keys, "valueChanged"),
@@ -3334,7 +3358,7 @@ class EditorTab(QWidget):
 
     def _refresh_font_combos(self) -> None:
         fonts = list_preview_fonts(self._current_target_path) if self._current_target_path else []
-        combos = [row["font_combo"] for row in self.visual_ann_part_rows] + [self.config_label_font_edit]
+        combos = [row["font_combo"] for row in self.visual_ann_part_rows] + [self.config_label_font_edit, self.config_text_font_edit]
         for combo in combos:
             current = combo.currentText().strip()
             combo.blockSignals(True)
@@ -3812,11 +3836,14 @@ class EditorTab(QWidget):
             self.config_home_page_edit.setText(str(data.get("home-page-name") or ""))
             self._combo_set_data_or_text(self.config_label_font_edit, str(data.get("default-label-font") or ""))
             self.config_label_size.setValue(int(data.get("default-label-size") or 0))
+            self._combo_set_data_or_text(self.config_text_font_edit, str(data.get("default-text-font") or ""))
             self.config_text_size.setValue(int(data.get("default-text-size") or 0))
+            self.config_text_color_edit.setText(str(data.get("default-text-color") or ""))
             self.config_label_color_edit.setText(str(data.get("default-label-color") or ""))
             self.config_label_position.setValue(str(data.get("default-label-position") or ""))
             self.config_vibrate.setValue(str(data.get("default-vibrate") or ""))
             self.config_icon_color_edit.setText(str(data.get("default-icon-color") or ""))
+            self.config_cockpit_color_edit.setText(str(data.get("cockpit-color") or ""))
             self.config_ann_style.setValue(str(data.get("default-annunciator-style") or ""))
             self.config_light_off_intensity.setValue(int(data.get("default-light-off-intensity") or 0))
             self.config_fill_empty_keys.setValue("true" if data.get("fill-empty-keys") else "false")
@@ -3838,11 +3865,14 @@ class EditorTab(QWidget):
         _set_or_pop("home-page-name", self.config_home_page_edit.text().strip())
         _set_or_pop("default-label-font", self.config_label_font_edit.currentText().strip())
         _set_or_pop("default-label-size", self.config_label_size.value())
+        _set_or_pop("default-text-font", self.config_text_font_edit.currentText().strip())
         _set_or_pop("default-text-size", self.config_text_size.value())
+        _set_or_pop("default-text-color", self.config_text_color_edit.text().strip())
         _set_or_pop("default-label-color", self.config_label_color_edit.text().strip())
         _set_or_pop("default-label-position", self.config_label_position.value())
         _set_or_pop("default-vibrate", self.config_vibrate.value())
         _set_or_pop("default-icon-color", self.config_icon_color_edit.text().strip())
+        _set_or_pop("cockpit-color", self.config_cockpit_color_edit.text().strip())
         _set_or_pop("default-annunciator-style", self.config_ann_style.value())
         _set_or_pop("default-light-off-intensity", self.config_light_off_intensity.value())
         if self.config_fill_empty_keys.value() == "true":
