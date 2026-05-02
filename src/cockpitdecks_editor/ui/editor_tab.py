@@ -8,7 +8,7 @@ from pathlib import Path
 
 import yaml
 from PySide6.QtCore import QPoint, QMimeData, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QDrag, QFont, QKeySequence, QMouseEvent, QPixmap, QTextOption, QPainter, QPainterPath, QResizeEvent, QPen
+from PySide6.QtGui import QColor, QDesktopServices, QDrag, QFont, QKeySequence, QMouseEvent, QPixmap, QTextOption, QPainter, QPainterPath, QResizeEvent, QPen, QTextDocument
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -2539,6 +2539,45 @@ class EditorTab(QWidget):
 
         self.stack.addWidget(self.button_edit_page)
 
+        # ── Text search bar (Ctrl+F in text mode) ─────────────────────────────
+        self._search_bar = QWidget()
+        _sb = QHBoxLayout(self._search_bar)
+        _sb.setContentsMargins(0, 0, 0, 0)
+        _sb.setSpacing(4)
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("Find…")
+        self._search_edit.setFixedHeight(26)
+        self._search_edit.returnPressed.connect(self._search_find_next)
+        self._search_edit.textChanged.connect(self._search_on_text_changed)
+        self._search_edit.keyPressEvent = self._search_edit_key_press
+        _sb.addWidget(self._search_edit, 1)
+        self._search_match_label = QLabel("")
+        self._search_match_label.setFixedWidth(60)
+        _sb.addWidget(self._search_match_label)
+        _btn_prev = QPushButton("▲")
+        _btn_prev.setFixedSize(26, 26)
+        _btn_prev.setToolTip("Previous match")
+        _btn_prev.clicked.connect(self._search_find_prev)
+        _sb.addWidget(_btn_prev)
+        _btn_next = QPushButton("▼")
+        _btn_next.setFixedSize(26, 26)
+        _btn_next.setToolTip("Next match")
+        _btn_next.clicked.connect(self._search_find_next)
+        _sb.addWidget(_btn_next)
+        self._search_case_btn = QPushButton("Aa")
+        self._search_case_btn.setCheckable(True)
+        self._search_case_btn.setFixedSize(32, 26)
+        self._search_case_btn.setToolTip("Match case")
+        self._search_case_btn.toggled.connect(lambda _: self._search_on_text_changed(self._search_edit.text()))
+        _sb.addWidget(self._search_case_btn)
+        _btn_close = QPushButton("✕")
+        _btn_close.setFixedSize(26, 26)
+        _btn_close.clicked.connect(self._search_close)
+        _sb.addWidget(_btn_close)
+        self._search_bar.setVisible(False)
+        right_layout.addWidget(self._search_bar)
+        # ── end search bar ─────────────────────────────────────────────────────
+
         right_layout.addWidget(self.stack, 1)
 
         self.designer_panel = QFrame()
@@ -2634,7 +2673,7 @@ class EditorTab(QWidget):
             self._update_action_state()
             return
 
-        self.file_tree.expandAll()
+        self.file_tree.collapseAll()
         self._update_tree_dirty_state()
         self.status_label.setText(f"{file_count} editable files loaded.")
         self._update_action_state()
@@ -2665,7 +2704,7 @@ class EditorTab(QWidget):
                     nodes[key] = item
                 parent = item
 
-        self.file_tree.expandAll()
+        self.file_tree.collapseAll()
         self._update_tree_dirty_state()
         self.status_label.setText(f"{len(files)} editable files loaded.")
         self._update_action_state()
@@ -3586,6 +3625,7 @@ class EditorTab(QWidget):
 
     def _switch_mode(self, mode: str, *, force: bool = False) -> None:
         if mode == "visual":
+            self._search_close()
             if not self._refresh_visual_availability(show_errors=not force):
                 self.btn_text_view.setChecked(True)
                 self.stack.setCurrentWidget(self.editor)
@@ -6336,6 +6376,95 @@ class EditorTab(QWidget):
                     self._preview_errors.get(key),
                 )
 
+    # ── Text search ────────────────────────────────────────────────────────────
+
+    def _search_edit_key_press(self, event) -> None:
+        if event.key() == Qt.Key.Key_Escape:
+            self._search_close()
+        elif event.key() == Qt.Key.Key_Up:
+            self._search_find_prev()
+        elif event.key() == Qt.Key.Key_Down:
+            self._search_find_next()
+        else:
+            QLineEdit.keyPressEvent(self._search_edit, event)
+
+    def _search_open(self) -> None:
+        if self.stack.currentWidget() is not self.editor:
+            return
+        self._search_bar.setVisible(True)
+        self._search_edit.setFocus()
+        self._search_edit.selectAll()
+        self._search_on_text_changed(self._search_edit.text())
+
+    def _search_close(self) -> None:
+        self._search_bar.setVisible(False)
+        self._search_edit.clear()
+        self._search_match_label.setText("")
+        self.editor.setFocus()
+
+    def _search_flags(self) -> QTextDocument.FindFlag:
+        flags = QTextDocument.FindFlag(0)
+        if self._search_case_btn.isChecked():
+            flags |= QTextDocument.FindFlag.FindCaseSensitively
+        return flags
+
+    def _search_find_next(self) -> None:
+        term = self._search_edit.text()
+        if not term:
+            return
+        found = self.editor.find(term, self._search_flags())
+        if not found:
+            cursor = self.editor.textCursor()
+            cursor.movePosition(cursor.MoveOperation.Start)
+            self.editor.setTextCursor(cursor)
+            self.editor.find(term, self._search_flags())
+        self._search_update_label()
+
+    def _search_find_prev(self) -> None:
+        term = self._search_edit.text()
+        if not term:
+            return
+        flags = self._search_flags() | QTextDocument.FindFlag.FindBackward
+        found = self.editor.find(term, flags)
+        if not found:
+            cursor = self.editor.textCursor()
+            cursor.movePosition(cursor.MoveOperation.End)
+            self.editor.setTextCursor(cursor)
+            self.editor.find(term, flags)
+        self._search_update_label()
+
+    def _search_on_text_changed(self, text: str) -> None:
+        if not text:
+            self._search_match_label.setText("")
+            self._search_edit.setStyleSheet("")
+            return
+        count = self._search_count_matches(text)
+        if count == 0:
+            self._search_match_label.setText("No results")
+            self._search_edit.setStyleSheet("background: #5c2020; color: white;")
+        else:
+            self._search_match_label.setText(f"{count} found")
+            self._search_edit.setStyleSheet("")
+            self.editor.find(text, self._search_flags())
+
+    def _search_count_matches(self, text: str) -> int:
+        doc = self.editor.document()
+        flags = self._search_flags()
+        count = 0
+        cursor = doc.find(text, 0, flags)
+        while not cursor.isNull():
+            count += 1
+            cursor = doc.find(text, cursor, flags)
+        return count
+
+    def _search_update_label(self) -> None:
+        text = self._search_edit.text()
+        if text:
+            count = self._search_count_matches(text)
+            self._search_match_label.setText(f"{count} found" if count else "No results")
+
+    # ── end text search ────────────────────────────────────────────────────────
+
     def keyPressEvent(self, event) -> None:
         if self.stack.currentWidget() is self.visual_scroll and self._selected_button_ids:
             if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
@@ -6349,6 +6478,15 @@ class EditorTab(QWidget):
         if self.stack.currentWidget() is self.visual_scroll:
             if event.matches(QKeySequence.StandardKey.Paste):
                 self._paste_buttons_from_clipboard()
+                event.accept()
+                return
+        if self.stack.currentWidget() is self.editor:
+            if event.matches(QKeySequence.StandardKey.Find):
+                self._search_open()
+                event.accept()
+                return
+            if event.key() == Qt.Key.Key_Escape and self._search_bar.isVisible():
+                self._search_close()
                 event.accept()
                 return
         super().keyPressEvent(event)

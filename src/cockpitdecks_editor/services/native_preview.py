@@ -402,6 +402,18 @@ def _side_display_slot_config(config: dict) -> tuple[dict, int] | None:
     return screen_config, slot
 
 
+def _truncate_log_lines(records: list[str], max_line: int = 120, max_lines: int = 4) -> str:
+    """Trim verbose cockpitdecks log records for display in the UI."""
+    trimmed = []
+    for line in records[:max_lines]:
+        if len(line) > max_line:
+            line = line[:max_line] + "…"
+        trimmed.append(line)
+    if len(records) > max_lines:
+        trimmed.append(f"… ({len(records) - max_lines} more)")
+    return "\n".join(trimmed)
+
+
 def render_button_preview_native(
     target_root: str | Path,
     deck_name: str,
@@ -436,10 +448,10 @@ def render_button_preview_native(
             deck = ctx.get_deck(deck_name)
             button = deck.make_button(config=config)
             if button is None:
-                log_detail = "\n".join(captured.records)
+                log_detail = _truncate_log_lines(captured.records)
                 msg = "button not created"
                 if log_detail:
-                    msg = f"{msg}\n\n{log_detail}"
+                    msg = f"{msg}\n{log_detail}"
                 return None, None, msg
             if fake_datarefs:
                 for dr_name, dr_value in fake_datarefs.items():
@@ -448,10 +460,10 @@ def render_button_preview_native(
                         var.value = dr_value
             image = button.get_representation()
             if image is None:
-                log_detail = "\n".join(captured.records)
+                log_detail = _truncate_log_lines(captured.records)
                 msg = "button representation not created"
                 if log_detail:
-                    msg = f"{msg}\n\n{log_detail}"
+                    msg = f"{msg}\n{log_detail}"
                 return None, None, msg
             target_size = deck.get_spanned_image_size(button) or deck.get_image_size(button.index)
             if target_size and not all(d > 0 for d in target_size):
@@ -469,7 +481,7 @@ def render_button_preview_native(
             image.save(buf, format="PNG")
             act_valid = button._activation.is_valid()
             rep_valid = button._representation.is_valid()
-            warnings = "\n".join(captured.records)
+            warnings = _truncate_log_lines(captured.records)
             meta = {
                 "error": "ok",
                 "activation-valid": act_valid,
