@@ -428,12 +428,18 @@ class DesignerTab(QWidget):
             self._set_preview_deck_name(deck_name)
         self._source_button_id = button_id
         self._source_file_path = file_path
+        is_library = file_path.startswith("__library__:")
         has_source = bool(button_id and file_path)
         self.btn_save_to_page.setEnabled(False)  # no changes yet
-        self.btn_save_to_page.setToolTip(
-            f"Apply back to {Path(file_path).name} ({button_id}) and return to the Editor tab (file not saved yet)" if has_source
-            else "No source page — use Copy YAML instead"
-        )
+        if is_library:
+            self.btn_save_to_page.setText("Save to Library")
+            self.btn_save_to_page.setToolTip("Save changes back to the button library")
+        else:
+            self.btn_save_to_page.setText("Done")
+            self.btn_save_to_page.setToolTip(
+                f"Apply back to {Path(file_path).name} ({button_id}) and return to the Editor tab (file not saved yet)" if has_source
+                else "No source page — use Copy YAML instead"
+            )
         try:
             data = yaml.safe_load(button_yaml) or {}
         except Exception:
@@ -455,7 +461,9 @@ class DesignerTab(QWidget):
 
     def _save_to_page(self) -> None:
         text = self.yaml_edit.toPlainText().strip()
-        if not text or not self._source_button_id or not self._source_file_path:
+        if not text or not self._source_button_id:
+            return
+        if not self._source_file_path:
             return
         self.save_to_page.emit(text, self._source_button_id, self._source_file_path)
         self.log_line.emit(f"Applied {self._source_button_id} to {Path(self._source_file_path).name} (unsaved)")

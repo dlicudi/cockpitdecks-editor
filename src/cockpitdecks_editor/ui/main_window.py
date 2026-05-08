@@ -107,7 +107,11 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentWidget(self.designer_tab)
 
     def _save_button_to_page(self, button_yaml: str, button_id: str, file_path: str) -> None:
-        self.editor_tab.save_button_from_designer(button_yaml, button_id)
+        if file_path.startswith("__library__:"):
+            entry_id = file_path[len("__library__:"):]
+            self.editor_tab.save_library_from_designer(button_yaml, entry_id)
+        else:
+            self.editor_tab.save_button_from_designer(button_yaml, button_id)
         self.tabs.setCurrentWidget(self.editor_tab)
 
     def _sync_root_summary(self, path: str) -> None:

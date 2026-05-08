@@ -53,6 +53,7 @@ except ImportError:
 from cockpitdecks_editor.services.live_apis import render_button_preview
 from cockpitdecks_editor.services.native_preview import describe_slot_native, list_preview_fonts, render_button_preview_native, warm_preview_pool, _side_display_slot_config
 from cockpitdecks_editor.services.desktop_settings import load as load_settings, save as save_settings
+from cockpitdecks_editor.ui.library_panel import LibraryPanel
 
 
 @dataclass
@@ -1235,6 +1236,7 @@ class _VisualGridHost(QWidget):
 
 class _GridSlot(QFrame):
     dropped = Signal(str, object)
+    library_dropped = Signal(dict, object)
     create_requested = Signal(object)
     context_requested = Signal(object, QPoint)
     deselect_requested = Signal()
@@ -1358,7 +1360,7 @@ class _GridSlot(QFrame):
             pass
 
     def dragEnterEvent(self, event) -> None:
-        if event.mimeData().hasText():
+        if event.mimeData().hasText() or event.mimeData().hasFormat(_BUTTON_CLIPBOARD_MIME):
             self._drag_hover = True
             self._apply_theme()
             event.acceptProposedAction()
@@ -1373,8 +1375,20 @@ class _GridSlot(QFrame):
     def dropEvent(self, event) -> None:
         self._drag_hover = False
         self._apply_theme()
+        text = event.mimeData().text()
+        if text.startswith("__lib__:") and event.mimeData().hasFormat(_BUTTON_CLIPBOARD_MIME):
+            try:
+                data = json.loads(bytes(event.mimeData().data(_BUTTON_CLIPBOARD_MIME)).decode("utf-8"))
+                if isinstance(data, dict):
+                    entry_id = text[len("__lib__:"):]
+                    data["__library_id__"] = entry_id
+                    self.library_dropped.emit(data, self.index)
+                    event.acceptProposedAction()
+                    return
+            except Exception:
+                pass
         if event.mimeData().hasText():
-            self.dropped.emit(event.mimeData().text(), self.index)
+            self.dropped.emit(text, self.index)
             event.acceptProposedAction()
         else:
             event.ignore()
@@ -1658,6 +1672,14 @@ class EditorTab(QWidget):
 
         self.zoom_label = QLabel("100%")
         _vzb.addWidget(self.zoom_label)
+
+        self.btn_library = QPushButton("Library")
+        self.btn_library.setCheckable(True)
+        self.btn_library.setFixedHeight(_BAR_BTN_H)
+        self.btn_library.setStyleSheet(_BAR_BTN_QSS)
+        self.btn_library.setToolTip("Toggle the button library panel")
+        self.btn_library.clicked.connect(self._toggle_library)
+        _vzb.addWidget(self.btn_library)
 
         header.addWidget(self._view_zoom_bar)
 
@@ -2631,9 +2653,16 @@ class EditorTab(QWidget):
         self.designer_panel.setMinimumWidth(280)
         self.designer_panel.setVisible(False)
         center_split.addWidget(self.designer_panel)
+
+        self.library_panel = LibraryPanel()
+        self.library_panel.setVisible(False)
+        self.library_panel.edit_requested.connect(self._edit_library_entry)
+        center_split.addWidget(self.library_panel)
+
         center_split.setStretchFactor(0, 1)
         center_split.setStretchFactor(1, 0)
-        center_split.setSizes([1240, 0])
+        center_split.setStretchFactor(2, 0)
+        center_split.setSizes([1240, 0, 0])
 
         body.addWidget(center_split)
         body.setStretchFactor(0, 0)
@@ -5276,6 +5305,7 @@ class EditorTab(QWidget):
                 slot_index = row * self._visual_cols + col
                 slot = _GridSlot(slot_index, dark=self._dark_mode, scale=self._visual_zoom)
                 slot.dropped.connect(self._move_button_to_index)
+                slot.library_dropped.connect(self._insert_button_from_library)
                 slot.create_requested.connect(self._create_new_button_at_index)
                 slot.context_requested.connect(self._show_slot_context_menu)
                 slot.deselect_requested.connect(self._clear_visual_selection)
@@ -5644,6 +5674,7 @@ class EditorTab(QWidget):
             idx = f"e{n}"
             slot = _GridSlot(idx, dark=self._dark_mode, scale=self._visual_zoom, width=side_w, height=side_h)
             slot.dropped.connect(self._move_button_to_index)
+            slot.library_dropped.connect(self._insert_button_from_library)
             slot.create_requested.connect(lambda _, _idx=idx: self._create_new_button_at_index(_idx))
             slot.deselect_requested.connect(self._clear_visual_selection)
             if n in enc_by_index:
@@ -5661,6 +5692,7 @@ class EditorTab(QWidget):
                 self._ld_center_layout.setColumnMinimumWidth(col, tile_px)
                 slot = _GridSlot(index, dark=self._dark_mode, scale=self._visual_zoom, width=tile_px, height=tile_px)
                 slot.dropped.connect(self._move_button_to_index)
+                slot.library_dropped.connect(self._insert_button_from_library)
                 slot.create_requested.connect(self._create_new_button_at_index)
                 slot.deselect_requested.connect(self._clear_visual_selection)
                 if index in center_by_index:
@@ -5677,6 +5709,7 @@ class EditorTab(QWidget):
             idx = f"e{n}"
             slot = _GridSlot(idx, dark=self._dark_mode, scale=self._visual_zoom, width=side_w, height=side_h)
             slot.dropped.connect(self._move_button_to_index)
+            slot.library_dropped.connect(self._insert_button_from_library)
             slot.create_requested.connect(lambda _, _idx=idx: self._create_new_button_at_index(_idx))
             slot.deselect_requested.connect(self._clear_visual_selection)
             if n in enc_by_index:
@@ -5765,6 +5798,7 @@ class EditorTab(QWidget):
             idx = f"e{n}"
             slot = _GridSlot(idx, dark=self._dark_mode, scale=self._visual_zoom, width=side_w, height=side_h)
             slot.dropped.connect(self._move_button_to_index)
+            slot.library_dropped.connect(self._insert_button_from_library)
             slot.create_requested.connect(lambda _, _idx=idx: self._create_new_button_at_index(_idx))
             slot.deselect_requested.connect(self._clear_visual_selection)
             if n in enc_by_index:
@@ -5784,6 +5818,7 @@ class EditorTab(QWidget):
             idx = f"e{n}"
             slot = _GridSlot(idx, dark=self._dark_mode, scale=self._visual_zoom, width=side_w, height=side_h)
             slot.dropped.connect(self._move_button_to_index)
+            slot.library_dropped.connect(self._insert_button_from_library)
             slot.create_requested.connect(lambda _, _idx=idx: self._create_new_button_at_index(_idx))
             slot.deselect_requested.connect(self._clear_visual_selection)
             if n in enc_by_index:
@@ -5868,6 +5903,8 @@ class EditorTab(QWidget):
             paste_action = menu.addAction("Paste Over Button")
             paste_action.setEnabled(self._clipboard_button_data() is not None)
             delete_action = menu.addAction("Delete Button")
+            menu.addSeparator()
+            add_lib_action = menu.addAction("Add to Library…")
         chosen = menu.exec(global_pos)
         if chosen is copy_action:
             self._copy_selection_to_clipboard()
@@ -5882,6 +5919,164 @@ class EditorTab(QWidget):
             return
         if chosen is delete_action:
             self._delete_selection()
+            return
+        if not is_multi and chosen is add_lib_action:
+            self._add_button_to_library(button_id)
+
+    def _add_button_to_library(self, button_id: str) -> None:
+        from cockpitdecks_editor.ui.add_to_library_dialog import AddToLibraryDialog
+        from cockpitdecks_editor.services.library_storage import add_entry
+        button_data = dict(self._visual_buttons.get(button_id, {}))
+        aircraft = self._current_target_path.name if self._current_target_path else ""
+        page = self._current_file_path.stem if self._current_file_path else ""
+        dlg = AddToLibraryDialog(button_data, source_aircraft=aircraft, source_page=page, parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.entry():
+            add_entry(dlg.entry())
+            self.library_panel.reload()
+            self.status_label.setText(f"Saved '{dlg.entry().name}' to library.")
+
+    def _config_roots(self) -> list[Path]:
+        """Return candidate config root directories (containing a 'decks/' child)."""
+        roots: list[Path] = []
+        if self._current_target_path is not None:
+            candidate = self._current_target_path.resolve()
+            for _ in range(8):
+                if (candidate / "decks").is_dir():
+                    roots.append(candidate)
+                    break
+                if candidate.parent == candidate:
+                    break
+                candidate = candidate.parent
+        return roots
+
+    def _edit_library_entry(self, entry_id: str) -> None:
+        from cockpitdecks_editor.services.library_storage import load_library
+        entry = next((e for e in load_library() if e.id == entry_id), None)
+        if entry is None:
+            return
+        button_yaml = yaml.safe_dump(entry.button_data, sort_keys=False, allow_unicode=False)
+        deck_name = str(self._visual_deck_name or "").strip()
+        root_path = str(self._current_target_path or "").strip()
+        # Sentinel file_path signals MainWindow to route the save back to the library.
+        self.open_in_designer.emit(button_yaml, deck_name, root_path, entry_id, f"__library__:{entry_id}")
+
+    def _update_linked_buttons(self, entry_id: str, new_button_data: dict) -> None:
+        """Replace button_data for every grid button in the open page linked to entry_id."""
+        changed = False
+        for bid, bdata in list(self._visual_buttons.items()):
+            if bdata.get("__library_id__") != entry_id:
+                continue
+            updated = dict(new_button_data)
+            updated["__library_id__"] = entry_id
+            updated["index"] = bdata.get("index")
+            if "name" in bdata:
+                updated["name"] = bdata["name"]
+            self._visual_buttons[bid] = updated
+            self._drop_preview_cache(bid)
+            changed = True
+        if changed:
+            self._sync_text_from_visual()
+            self._rebuild_visual_widgets()
+            self._refresh_selected_button_panel()
+
+    def _collect_linked_files(self, entry_id: str) -> dict[Path, int]:
+        """Scan all deckconfig YAML files and return {path: button_count} for those with linked buttons."""
+        from cockpitdecks_editor.services.library_storage import CuratedEntry
+        matched: dict[Path, int] = {}
+        skip = self._current_file_path.resolve() if self._current_file_path else None
+        for root in self._config_roots():
+            for yaml_file in sorted(root.rglob("*.yaml")):
+                parts = yaml_file.parts
+                if "deckconfig" not in parts:
+                    continue
+                if "includes" in parts or "resources" in parts:
+                    continue
+                resolved = yaml_file.resolve()
+                if resolved == skip:
+                    continue
+                try:
+                    raw = yaml.safe_load(yaml_file.read_text(encoding="utf-8", errors="replace")) or {}
+                except Exception:
+                    continue
+                if not isinstance(raw, dict):
+                    continue
+                buttons = raw.get("buttons")
+                if not isinstance(buttons, list):
+                    continue
+                count = sum(
+                    1 for b in buttons
+                    if isinstance(b, dict) and b.get("__library_id__") == entry_id
+                )
+                if count:
+                    matched[yaml_file] = count
+        return matched
+
+    def _apply_library_update_to_files(
+        self, entry_id: str, new_button_data: dict, files: dict[Path, int]
+    ) -> int:
+        """Write updated button data into each file. Returns number of files changed."""
+        written = 0
+        for yaml_file in files:
+            try:
+                raw = yaml.safe_load(yaml_file.read_text(encoding="utf-8", errors="replace")) or {}
+                if not isinstance(raw, dict):
+                    continue
+                buttons = raw.get("buttons")
+                if not isinstance(buttons, list):
+                    continue
+                changed = False
+                for i, btn in enumerate(buttons):
+                    if not isinstance(btn, dict):
+                        continue
+                    if btn.get("__library_id__") != entry_id:
+                        continue
+                    replacement = dict(new_button_data)
+                    replacement["__library_id__"] = entry_id
+                    replacement["index"] = btn.get("index")
+                    if "name" in btn:
+                        replacement["name"] = btn["name"]
+                    buttons[i] = replacement
+                    changed = True
+                if not changed:
+                    continue
+                raw["buttons"] = buttons
+                yaml_file.write_text(
+                    yaml.safe_dump(raw, sort_keys=False, allow_unicode=False),
+                    encoding="utf-8",
+                )
+                written += 1
+            except Exception:
+                continue
+        return written
+
+    def _propagate_library_edit(self, entry_id: str, updated) -> None:
+        from PySide6.QtWidgets import QMessageBox
+        files = self._collect_linked_files(entry_id)
+        if not files:
+            self.status_label.setText(f"Library entry '{updated.name}' updated (no other linked files found).")
+            return
+        total_buttons = sum(files.values())
+        file_list = "\n".join(
+            f"  {f.relative_to(f.parents[max(0, len(f.parts) - 4)])}  ({n} button{'s' if n != 1 else ''})"
+            for f, n in sorted(files.items())
+        )
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Propagate to Linked Files?")
+        msg.setText(
+            f"<b>{total_buttons} linked button{'s' if total_buttons != 1 else ''}</b> found in "
+            f"{len(files)} other file{'s' if len(files) != 1 else ''}.<br>"
+            "Update them all with the new button data?"
+        )
+        msg.setDetailedText(file_list)
+        msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        msg.setDefaultButton(QMessageBox.StandardButton.Yes)
+        if msg.exec() != QMessageBox.StandardButton.Yes:
+            self.status_label.setText(f"Library entry '{updated.name}' updated (other files skipped).")
+            return
+        written = self._apply_library_update_to_files(entry_id, updated.button_data, files)
+        self.status_label.setText(
+            f"Library entry '{updated.name}' updated — propagated to {written} file{'s' if written != 1 else ''}."
+        )
 
     def _show_slot_context_menu(self, slot_index: int, global_pos: QPoint) -> None:
         menu = QMenu(self)
@@ -6018,6 +6213,40 @@ class EditorTab(QWidget):
         self.status_label.setText(f"Pasted button into slot {target_index}.")
         QTimer.singleShot(0, lambda: self.visual_scroll.verticalScrollBar().setValue(scroll_pos))
 
+    def _insert_button_from_library(self, button_data: dict, target_index: int | str) -> None:
+        inserted = dict(button_data)
+        inserted["index"] = target_index
+        new_name = self._unique_button_name(
+            self._button_name(inserted),
+            list(self._visual_buttons.values()),
+            exclude_index=target_index if isinstance(target_index, int) else None,
+        )
+        if new_name:
+            inserted["name"] = new_name
+        else:
+            inserted.pop("name", None)
+        existing_id = self._button_id_at_index(target_index)
+        if existing_id is not None:
+            self._visual_buttons[existing_id] = inserted
+            self._selected_button_id = existing_id
+            self._drop_preview_cache(existing_id)
+        else:
+            bid = f"btn-{target_index}"
+            suffix = 1
+            while bid in self._visual_buttons:
+                suffix += 1
+                bid = f"btn-{target_index}-{suffix}"
+            self._visual_buttons[bid] = inserted
+            self._selected_button_id = bid
+            self._drop_preview_cache(bid)
+        scroll_pos = self.visual_scroll.verticalScrollBar().value()
+        self._sync_text_from_visual()
+        self._rebuild_visual_widgets()
+        self._refresh_selected_button_panel()
+        self._update_action_state()
+        self.status_label.setText(f"Inserted library button into slot {target_index}.")
+        QTimer.singleShot(0, lambda: self.visual_scroll.verticalScrollBar().setValue(scroll_pos))
+
     def _apply_button_yaml(self, button_id: str, text: str, *, silent: bool = False) -> bool:
         try:
             data = yaml.safe_load(text) or {}
@@ -6080,6 +6309,36 @@ class EditorTab(QWidget):
         if not button_id or not self._current_file_path:
             return
         self._apply_button_yaml(button_id, button_yaml, silent=False)
+
+    def save_library_from_designer(self, button_yaml: str, entry_id: str) -> None:
+        """Called by MainWindow when the designer saves a library entry."""
+        from cockpitdecks_editor.services.library_storage import load_library, add_entry
+        from cockpitdecks_editor.services.library_scanner import _extract_datarefs, _portability
+        from cockpitdecks_editor.services.library_storage import CuratedEntry
+        entry = next((e for e in load_library() if e.id == entry_id), None)
+        if entry is None:
+            return
+        try:
+            new_data = yaml.safe_load(button_yaml) or {}
+            if not isinstance(new_data, dict):
+                return
+        except Exception:
+            return
+        datarefs = _extract_datarefs(new_data)
+        updated = CuratedEntry(
+            id=entry.id,
+            name=entry.name,
+            category=entry.category,
+            tags=entry.tags,
+            source_aircraft=entry.source_aircraft,
+            source_page=entry.source_page,
+            button_data=new_data,
+            portability=_portability(datarefs),
+        )
+        add_entry(updated)
+        self.library_panel.reload()
+        self._update_linked_buttons(entry_id, new_data)
+        self._propagate_library_edit(entry_id, updated)
 
     def _open_button_editor_workspace(self, button_id: str, *, initial_text: str | None = None, on_apply=None) -> None:
         self._button_edit_id = button_id
@@ -6233,6 +6492,13 @@ class EditorTab(QWidget):
         fit = min(fit_w, fit_h) * 0.96
         self._set_visual_zoom(min(1.0, fit))
         self.status_label.setText(f"Fitted visual grid to {int(round(self._visual_zoom * 100))}%.")
+
+    def _toggle_library(self) -> None:
+        visible = not self.library_panel.isVisible()
+        self.library_panel.setVisible(visible)
+        self.btn_library.setChecked(visible)
+        if visible:
+            self.library_panel.reload()
 
     def _sync_text_from_visual(self) -> None:
         if self._visual_yaml_data is None:
